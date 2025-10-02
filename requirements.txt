@@ -1,0 +1,5 @@
+cryptography
+flask
+flask-socketio
+eventlet
+requestss

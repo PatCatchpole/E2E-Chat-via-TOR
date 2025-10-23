@@ -1,6 +1,0 @@
-cryptography
-flask
-flask-socketio
-eventlet
-requests
-pysocks

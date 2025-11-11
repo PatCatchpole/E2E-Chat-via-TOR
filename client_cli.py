@@ -95,9 +95,12 @@ class SpectreClient:
 
                 # 2) Advance receiving chain up to n (MVP in-order)
                 n = int(hdr["n"])
+
+                # Skip messages if needed (out of order handling)
                 while self.state.receiving_chain.index < n:
                     _ = self.state.receiving_chain.next_message_key()
 
+                # Now decrypt the message at index n
                 mk = self.state.receiving_chain.next_message_key()
                 pt = decrypt_with_message_key(mk, body["nonce_b64"], body["ct_b64"])
                 print(f"\n[{self.user} recv] {pt.decode()}")
@@ -125,7 +128,12 @@ class SpectreClient:
         print("\nPaste peer bundle JSON and press Enter (or leave blank to skip):")
         raw = sys.stdin.readline().strip()
         if raw:
-            self._load_peer_bundle(json.loads(raw))
+            try:
+                self._load_peer_bundle(json.loads(raw))
+            except json.JSONDecodeError as e:
+                print(f"[!] Invalid JSON: {e}")
+            except Exception as e:
+                print(f"[!] Error loading bundle: {e}")
 
     def print_my_bundle(self):
         print_hr()
@@ -137,12 +145,21 @@ class SpectreClient:
         if not (self.peer_id_pub and self.peer_eph_pub and self.peer_init_dh_pub):
             return
         # X3DH → root key
-        root_key = derive_shared_secret(
-            initiator_priv_id=self.id_priv,
-            initiator_priv_eph=self.eph_priv,
-            responder_pub_id=self.peer_id_pub,
-            responder_pub_eph=self.peer_eph_pub,
-        )
+        if self.is_initiator:
+            root_key = derive_shared_secret(
+                initiator_priv_id=self.id_priv,
+                initiator_priv_eph=self.eph_priv,
+                responder_pub_id=self.peer_id_pub,
+                responder_pub_eph=self.peer_eph_pub,
+            )
+        else:
+            from crypto.x3dh import dh, kdf
+            dh1 = dh(self.id_priv, self.peer_id_pub)       # DH(responder_priv_id, initiator_pub_id)
+            dh2 = dh(self.id_priv, self.peer_eph_pub)      # DH(responder_priv_id, initiator_pub_eph)
+            dh3 = dh(self.eph_priv, self.peer_id_pub)      # DH(responder_priv_eph, initiator_pub_id)
+            combined = dh1 + dh2 + dh3
+            root_key = kdf(combined)
+                    
         # Double Ratchet state
         self.state = RatchetState(
             root_key=root_key,
@@ -172,11 +189,13 @@ class SpectreClient:
         else:
             hdr_pub_b64 = b64_pubkey(self.state.dh_keypair.public_key)
 
+        # Get the message key and the index BEFORE incrementing
+        n = self.state.sending_chain.index
         mk = self.state.sending_chain.next_message_key()
         body = encrypt_with_message_key(mk, text.encode("utf-8"))
         pkt = {
             "type": "msg",
-            "hdr": {"dh_pub_b64": hdr_pub_b64, "n": self.state.sending_chain.index},
+            "hdr": {"dh_pub_b64": hdr_pub_b64, "n": n},
             "body": body,
         }
         self.send_packet(pkt)

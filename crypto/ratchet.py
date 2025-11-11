@@ -59,17 +59,13 @@ class RatchetState:
         self.their_dh_pub = their_dh_pub
         self.is_initiator = is_initiator
 
-        # Establish BOTH chains from the same initial DH output.
         dh_out = dh(self.dh_keypair, self.their_dh_pub)
         self.root_key, base_seed = kdf_root(self.root_key, dh_out)
 
-        # Deterministic direction split:
-        # Initiator uses "send" for its sending chain; responder uses "recv" for its sending chain.
         if self.is_initiator:
             send_ck = kdf_direction(base_seed, b"SEND")
             recv_ck = kdf_direction(base_seed, b"RECV")
         else:
-            # Mirror mapping for responder
             send_ck = kdf_direction(base_seed, b"RECV")
             recv_ck = kdf_direction(base_seed, b"SEND")
 

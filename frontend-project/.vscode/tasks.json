@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Instalar socket.io-client",
+			"type": "shell",
+			"command": "npm install socket.io-client",
+			"group": "build"
+		}
+	]
+}

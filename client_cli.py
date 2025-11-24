@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import requests
 from typing import Optional
 
 import socketio
@@ -16,6 +17,19 @@ from crypto.keys import (
 from crypto.x3dh import derive_shared_secret
 from crypto.ratchet import RatchetState
 from crypto.message import encrypt_with_message_key, decrypt_with_message_key
+from getpass import getpass 
+from urllib.parse import urlparse
+
+
+ # --- login simples (apenas demo) ---
+USERS = [
+    {"usuario": "alice", "senha": "alice123"},
+    {"usuario": "bob",   "senha": "bob456"},
+]
+
+def check_login_local(usuario: str, senha: str) -> bool:
+    return any(u["usuario"] == usuario and u["senha"] == senha for u in USERS)
+# --- fim login simples ---
 
 # ---------- helpers ----------
 def b64_pubkey(pk: PublicKey) -> str:
@@ -54,7 +68,14 @@ class SpectreClient:
         self.state: Optional[RatchetState] = None
 
         # Socket.IO client
-        self.sio = socketio.Client()
+        # Route Socket.IO HTTP polling through Tor’s SOCKS proxy
+        session = requests.Session()
+        session.proxies = {
+            "http":  "socks5h://127.0.0.1:9050",
+            "https": "socks5h://127.0.0.1:9050",
+        }
+        # Use polling transport (works reliably over Tor)
+        self.sio = socketio.Client(http_session=session)
 
         @self.sio.event
         def connect():
@@ -170,8 +191,10 @@ class SpectreClient:
         print("[*] Ratchet initialized.")
 
     # ---------- socket lifecycle ----------
-    def connect(self):
-        self.sio.connect(self.url, wait=True)
+    def connect(self, url = None):
+        if url: 
+            self.sio.connect(self.url)
+        self.sio.connect(self.url, wait = True, transports=["polling"])
 
     def start_recv_loop(self):
         t = threading.Thread(target=self.sio.wait, daemon=True)
@@ -201,14 +224,25 @@ class SpectreClient:
         self.send_packet(pkt)
 
 def main():
-    url = "http://127.0.0.1:5000"
     room = prompt("Room name: ").strip() or "spectre"
     user = prompt("Your name: ").strip() or "user"
     role = prompt("Role [i=initiator / r=responder]: ").strip().lower()
     is_initiator = (role != "r")
 
-    cli = SpectreClient(url, room, user, is_initiator=is_initiator)
-    cli.connect()
+    pwd = getpass(f"Senha de {user}: ")
+    if not check_login_local(user, pwd):
+        print("[!] Login falhou (usuário/senha). Encerrando.")
+        return
+
+    onion = input("Onion host (leave blank for localhost): ").strip()
+    if onion:
+        url = f"http://dhvy4dxbb543b43tcmkkuizksvezwmghsoc75jccwh4djk2y7zzeuwqd.onion"
+    else:
+        url = "http://127.0.0.1:5000"
+
+    cli = SpectreClient(url=url, room=room, user=user, is_initiator=is_initiator)
+    cli.connect(url)
+
     cli.start_recv_loop()
 
     # Out-of-band exchange (demo: copy/paste JSON).

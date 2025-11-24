@@ -1,9 +1,9 @@
 import json
 import sys
 import threading
-import requests
 from typing import Optional
 
+import requests
 import socketio
 from nacl.public import PrivateKey, PublicKey
 from nacl.encoding import Base64Encoder
@@ -17,11 +17,11 @@ from crypto.keys import (
 from crypto.x3dh import derive_shared_secret
 from crypto.ratchet import RatchetState
 from crypto.message import encrypt_with_message_key, decrypt_with_message_key
-from getpass import getpass 
+from getpass import getpass
 from urllib.parse import urlparse
 
 
- # --- login simples (apenas demo) ---
+# --- login simples (apenas demo) ---
 USERS = [
     {"usuario": "alice", "senha": "alice123"},
     {"usuario": "bob",   "senha": "bob456"},
@@ -30,6 +30,7 @@ USERS = [
 def check_login_local(usuario: str, senha: str) -> bool:
     return any(u["usuario"] == usuario and u["senha"] == senha for u in USERS)
 # --- fim login simples ---
+
 
 # ---------- helpers ----------
 def b64_pubkey(pk: PublicKey) -> str:
@@ -44,9 +45,10 @@ def prompt(msg: str) -> str:
 def print_hr():
     print("-" * 60)
 
+
 # ---------- CLI client ----------
 class SpectreClient:
-    def __init__(self, url: str, room: str, user: str, is_initiator: bool):
+    def __init__(self, url: str, room: str, user: str, is_initiator: bool, use_tor: bool):
         self.url = url
         self.room = room
         self.user = user
@@ -68,14 +70,17 @@ class SpectreClient:
         self.state: Optional[RatchetState] = None
 
         # Socket.IO client
-        # Route Socket.IO HTTP polling through Tor’s SOCKS proxy
-        session = requests.Session()
-        session.proxies = {
-            "http":  "socks5h://127.0.0.1:9050",
-            "https": "socks5h://127.0.0.1:9050",
-        }
-        # Use polling transport (works reliably over Tor)
-        self.sio = socketio.Client(http_session=session)
+        if use_tor:
+            # Route Socket.IO HTTP polling through Tor’s SOCKS proxy
+            session = requests.Session()
+            session.proxies = {
+                "http":  "socks5h://127.0.0.1:9150",
+                "https": "socks5h://127.0.0.1:9150",
+            }
+            # Use polling transport (works reliably over Tor)
+            self.sio = socketio.Client(http_session=session)
+        else:
+            self.sio = socketio.Client()
 
         @self.sio.event
         def connect():
@@ -192,9 +197,14 @@ class SpectreClient:
 
     # ---------- socket lifecycle ----------
     def connect(self, url = None):
-        if url: 
-            self.sio.connect(self.url)
-        self.sio.connect(self.url, wait = True, transports=["polling"])
+        if url is not None:
+            self.url = url
+        self.sio.connect(
+            self.url,
+            wait=True,
+            wait_timeout=30,   # mais tempo por causa da latência do Tor
+            transports=["polling"],
+        )
 
     def start_recv_loop(self):
         t = threading.Thread(target=self.sio.wait, daemon=True)
@@ -236,11 +246,16 @@ def main():
 
     onion = input("Onion host (leave blank for localhost): ").strip()
     if onion:
-        url = f"http://dhvy4dxbb543b43tcmkkuizksvezwmghsoc75jccwh4djk2y7zzeuwqd.onion"
+        onion = onion.strip()
+        if onion.endswith(".onion"):
+            onion = onion[:-6]
+        url = f"http://{onion}.onion:80"
+        use_tor = True
     else:
         url = "http://127.0.0.1:5000"
+        use_tor = False
 
-    cli = SpectreClient(url=url, room=room, user=user, is_initiator=is_initiator)
+    cli = SpectreClient(url=url, room=room, user=user, is_initiator=is_initiator, use_tor=use_tor)
     cli.connect(url)
 
     cli.start_recv_loop()

@@ -40,8 +40,9 @@ def handle_packet(data):
 
 @socketio.on('message')
 def handle_message(data):
+    room = data.get('room')
     print("Received (Encrypted):", data)
-    emit('message', data, broadcast=True)
+    emit('message', data, room=room)
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)

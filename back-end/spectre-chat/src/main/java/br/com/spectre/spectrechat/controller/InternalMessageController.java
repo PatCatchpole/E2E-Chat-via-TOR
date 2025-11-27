@@ -71,8 +71,6 @@ public class InternalMessageController {
                 saved.getCreatedAt()
         );
 
-        log.info("DTO", dto);
-
         return ResponseEntity.status(HttpStatus.CREATED).body(dto);
     }
 

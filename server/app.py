@@ -94,7 +94,6 @@ def handle_disconnect():
                 user = participants[sid]["user"]
             del participants[sid]
             print(f"[*] {user} removed from room {room}")
-            emit("sys", {"msg": f"{user} exited the room"}, room=room)
 
         if not participants:
             del rooms_state[room]
@@ -198,7 +197,6 @@ def handle_join(data):
     role   = data.get("role")
     bundle = data.get("bundle")
 
-    # precisa estar logado
     if sid not in sessions or sessions[sid]["user"] != user:
         emit("sys", {"msg": "Precisa fazer login primeiro."})
         return
@@ -207,7 +205,6 @@ def handle_join(data):
     print(f"[*] {user} joined room: {room}")
     emit("sys", {"msg": f"{user} joined the room"}, room=room)
 
-    # registra os participantes e pega o lastSeenMessageId
     try:
         join_resp = backend_post("/internal/rooms/join", {
             "room": room,
@@ -217,9 +214,11 @@ def handle_join(data):
         print(f"[!] Erro /internal/rooms/join: {e}")
         join_resp = {}
 
-    last_seen = join_resp.get("lastSeenMessageId")
+    print(f"[JOIN] user={user} room={room} join_resp={join_resp}")
 
-    # estado local
+    last_seen = join_resp.get("lastSeenMessageId")
+    print(f"[JOIN] user={user} room={room} last_seen(before fetch)={last_seen}")
+
     if room not in rooms_state:
         rooms_state[room] = {"participants": {}}
 
@@ -229,7 +228,6 @@ def handle_join(data):
         "bundle": bundle
     }
 
-    # salva o bundle no back-end
     try:
         backend_post(f"/internal/rooms/{room}/bundles", {
             "user": user,
@@ -238,7 +236,6 @@ def handle_join(data):
     except Exception as e:
         print(f"[!] Erro ao salvar bundle: {e}")
 
-    # troca dos bundles com quem tá na sala
     participants = rooms_state[room]["participants"]
     others = [(other_sid, info) for other_sid, info in participants.items() if other_sid != sid]
 
@@ -257,15 +254,20 @@ def handle_join(data):
 
         print(f"[*] Bundle exchange between {user} and {other_info['user']} in room {room}")
 
-    # procura mensagens desde lastSeen
     try:
         params = {}
         if last_seen is not None:
             params["sinceId"] = last_seen
+
+        print(f"[JOIN] user={user} room={room} fetching backlog with params={params}")
+
         msgs = backend_get(f"/internal/rooms/{room}/messages", params=params) or []
+
+        print(f"[JOIN] user={user} room={room} msgs_ids={[m['id'] for m in msgs]}")
     except Exception as e:
         print(f"[!] Erro ao buscar mensagens pendentes: {e}")
         msgs = []
+        params = {}
 
     max_id = last_seen or 0
 
@@ -281,27 +283,39 @@ def handle_join(data):
         except Exception:
             print(f"[!] Erro parse JSON em message {mid}")
             continue
+        
+        if sender == user:
+            continue
 
         socketio.emit("packet", {
             "type": "msg",
             "room": room,
             "user": sender,
             "hdr": hdr,
-            "body": body
+            "body": body,
+            "id": mid,
         }, room=sid)
+
 
         if mid > max_id:
             max_id = mid
+            
+@socketio.on("leave")
+def handle_leave(data):
+    sid  = request.sid
+    room = data.get("room")
+    user = data.get("user")
 
-    # atualiza last_seen_message_id se recebeu algo
-    if max_id and max_id != (last_seen or 0):
-        try:
-            backend_post(f"/internal/rooms/{room}/last-seen", {
-                "user": user,
-                "lastSeenMessageId": max_id
-            })
-        except Exception as e:
-            print(f"[!] Erro ao atualizar last-seen: {e}")
+    if room in rooms_state:
+        participants = rooms_state[room].get("participants", {})
+        if sid in participants:
+            del participants[sid]
+            print(f"[*] {user} left room {room} via /leave")
+            emit("sys", {"msg": f"{user} exited the room"}, room=room)
+
+        if not participants:
+            del rooms_state[room]
+            print(f"[*] Room {room} now empty; removed from state.")
 
 
 # ---------- MENSAGENS ----------
@@ -309,7 +323,6 @@ def handle_join(data):
 @socketio.on("packet")
 def handle_packet(data):
     """
-    Apenas para mensagens:
     {
       "type": "msg",
       "room": "...",
@@ -322,7 +335,6 @@ def handle_packet(data):
     pkt_type = data.get("type")
 
     if pkt_type != "msg":
-        # bundles não deveriam vir aqui
         print("[*] Ignorando packet type != 'msg'")
         return
 
@@ -337,19 +349,43 @@ def handle_packet(data):
     except Exception as e:
         print(f"[!] Erro ao salvar mensagem no backend: {e}")
 
-    emit("packet", data, room=room, include_self=False)
+    out = dict(data)
+    if msg_id is not None:
+        out["id"] = msg_id
 
-    if msg_id is not None and room in rooms_state:
-        participants = rooms_state[room].get("participants", {})
-        for sid, info in participants.items():
-            username = info["user"]
-            try:
-                backend_post(f"/internal/rooms/{room}/last-seen", {
-                    "user": username,
-                    "lastSeenMessageId": msg_id
-                })
-            except Exception as e:
-                print(f"[!] Erro ao atualizar last-seen de {username}: {e}")
+    emit("packet", out, room=room, include_self=False)
+    
+@socketio.on("seen")
+def handle_seen(data):
+    """
+    Client -> server:
+    {
+      "room": "...",
+      "lastSeenMessageId": 123
+    }
+    """
+    sid = request.sid
+    if sid not in sessions:
+        print("[!] seen recebido de sid sem sessão")
+        return
+
+    user = sessions[sid]["user"]
+    room = data.get("room")
+    last_seen_id = data.get("lastSeenMessageId")
+
+    if room is None or last_seen_id is None:
+        print("[!] seen inválido (room ou lastSeenMessageId ausentes)")
+        return
+
+    try:
+        backend_post(f"/internal/rooms/{room}/last-seen", {
+            "user": user,
+            "lastSeenMessageId": last_seen_id
+        })
+        print(f"[SEEN] user={user} room={room} lastSeen={last_seen_id}")
+    except Exception as e:
+        print(f"[!] Erro ao processar seen de {user} em {room}: {e}")
+
 
 if __name__ == "__main__":
     socketio.run(app, host="127.0.0.1", port=5000, debug=False)

@@ -42,24 +42,43 @@ public class InternalRoomController {
                                 .build()
                 ));
 
-        RoomParticipant participant = participantRepo.findByUserAndRoom(user, room)
-                .orElseGet(() -> {
-                    Long maxId = messageRepo.findMaxIdByRoom(room).orElse(null);
-                    RoomParticipant rp = RoomParticipant.builder()
-                            .user(user)
-                            .room(room)
-                            .joinedAt(Instant.now())
-                            .lastSeenMessageId(maxId)
-                            .build();
-                    return participantRepo.save(rp);
-                });
+        var existingOpt = participantRepo.findByUserAndRoom(user, room);
+        boolean isNewParticipant = existingOpt.isEmpty();
+
+        RoomParticipant participant = existingOpt.orElseGet(() -> participantRepo.save(
+                RoomParticipant.builder()
+                        .user(user)
+                        .room(room)
+                        .joinedAt(Instant.now())
+                        .lastSeenMessageId(null)
+                        .build()
+        ));
+
+        System.out.println("JOIN-ROOM: user=" + user.getUsername()
+                + " room=" + room.getKeyword()
+                + " before lastSeen=" + participant.getLastSeenMessageId()
+                + " isNew=" + isNewParticipant);
 
         Long lastSeen = participant.getLastSeenMessageId();
+
+        System.out.println("JOIN-ROOM: user=" + user.getUsername()
+                + " room=" + room.getKeyword()
+                + " returning lastSeen=" + lastSeen);
+
+        if (isNewParticipant && lastSeen == null) {
+            Long maxId = messageRepo.findMaxIdByRoom(room).orElse(null);
+            if (maxId != null) {
+                participant.setLastSeenMessageId(maxId);
+                participantRepo.save(participant);
+                lastSeen = maxId;
+            }
+        }
 
         return ResponseEntity.ok(
                 new JoinRoomInternalResponse(room.getId(), lastSeen)
         );
     }
+
 
     @PostMapping("/{keyword}/last-seen")
     public ResponseEntity<?> updateLastSeen(

@@ -5,6 +5,8 @@ from typing import Optional
 import os
 import pathlib
 from getpass import getpass
+import time
+import errno
 
 import bcrypt
 import requests
@@ -170,10 +172,34 @@ def deserialize_ratchet_state(data: dict) -> RatchetState:
 def save_ratchet_state_to_disk(state: RatchetState, user: str, room: str) -> None:
     path = ratchet_state_path(user, room)
     payload = serialize_ratchet_state(state, user, room)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    os.replace(tmp, path)
+
+    tmp = f"{path}.tmp.{os.getpid()}"
+
+    last_err = None
+
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+            os.replace(tmp, path)
+            return
+
+        except PermissionError as e:
+            last_err = e
+            print(f"[!] Permission denied saving ratchet state (attempt {attempt+1}): {e}")
+            time.sleep(0.1)
+
+        except OSError as e:
+            last_err = e
+            if e.errno in (errno.EACCES, errno.EPERM):
+                print(f"[!] OS error saving ratchet state (attempt {attempt+1}): {e}")
+                time.sleep(0.1)
+            else:
+                break
+
+    # se chegou aqui, não conseguiu persistir — mas o estado em memória continua válido
+    print(f"[!] Failed to persist ratchet state to {path} after retries: {last_err}")
 
 def load_ratchet_state_from_disk(user: str, room: str) -> Optional[RatchetState]:
     path = ratchet_state_path(user, room)
@@ -324,7 +350,6 @@ class SpectreClient:
                 except Exception as e:
                     print(f"\n[!] Failed to persist ratchet state after receive: {e}")
                     print("> ", end="", flush=True)
-                    return
 
                 msg_id = data.get("id")
                 if msg_id is not None:
@@ -444,6 +469,7 @@ class SpectreClient:
                     print(f"[!] Error processing queued msg: {e}")
 
         print("[*] Ratchet synchronized.")
+        print("> ", end="", flush=True)
 
 
 
@@ -542,14 +568,23 @@ def main():
 
     stored = load_stored_hash(user)
     if stored:
-        pwd_hash = stored
-        print("[*] Using stored password hash.")
-    else:
-        pwd_hash = bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
-        store_hash(user, pwd_hash)
-        print("[*] New hash generated & stored locally.")
+        try:
+            if not bcrypt.checkpw(pwd.encode(), stored.encode()):
+                print("[!] Senha incorreta para este usuário local.")
+                return
+        except ValueError as e:
+            print(f"[!] Hash salvo inválido/corrompido para {user}: {e}")
+            print("[!] Apague o arquivo de credenciais ou registre esse usuário novamente.")
+            return
 
-    # -- Tor / localhost selection --
+        pwd_hash = stored
+        print("[*] Using stored password hash (senha verificada).")
+    else:
+            pwd_hash = bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
+            store_hash(user, pwd_hash)
+            print("[*] New hash generated & stored locally.")
+
+
     onion = input("Onion host (leave blank for localhost): ").strip()
     if onion:
         if onion.endswith(".onion"):

@@ -280,16 +280,20 @@ class SpectreClient:
         def on_bundle(data):
             """
             {
-              "from": "Bob",
-              "bundle": {
-                  "user": "...",
-                  "identity_pub_b64": "...",
-                  "ephemeral_pub_b64": "...",
-                  "init_dh_pub_b64": "...",
-                  "role": "initiator"|"responder"
-              }
+            "from": "...",
+            "bundle": {
+                "user": "...",
+                "identity_pub_b64": "...",
+                "ephemeral_pub_b64": "...",
+                "init_dh_pub_b64": "...",
+                "role": "initiator"|"responder"
+            }
             }
             """
+            if self.state is not None:
+                print(f"[*] Bundle received from {data['bundle'].get('user')} but ratchet already exists; ignoring.")
+                return
+
             b = data["bundle"]
             self.peer_id_pub = import_public_key(b["identity_pub_b64"])
             self.peer_eph_pub = import_public_key(b["ephemeral_pub_b64"])
@@ -298,35 +302,59 @@ class SpectreClient:
             print(f"[!] Bundle received from {b.get('user', 'peer')}")
             self._maybe_init_ratchet()
 
+
         @self.sio.on("packet")
         def on_packet(data):
             try:
                 if data.get("type") != "msg":
                     return
+                
+                sender = data.get("user")
+                if sender == self.user:
+                    return
 
                 if self.state is None:
-                    # Ratchet ainda não pronto: enfileira
                     self.pending_packets.append(data)
                     return
 
                 self._process_incoming_message_packet(data)
 
-                # após receber mensagem, o ratchet avançou; salvar estado
-                save_ratchet_state_to_disk(self.state, self.user, self.room)
+                try:
+                    save_ratchet_state_to_disk(self.state, self.user, self.room)
+                except Exception as e:
+                    print(f"\n[!] Failed to persist ratchet state after receive: {e}")
+                    print("> ", end="", flush=True)
+                    return
+
+                msg_id = data.get("id")
+                if msg_id is not None:
+                    try:
+                        self.sio.emit(
+                            "seen",
+                            {
+                                "room": self.room,
+                                "lastSeenMessageId": msg_id,
+                            },
+                        )
+                    except Exception as e:
+                        print(f"\n[!] Failed to send seen ACK: {e}")
+                        print("> ", end="", flush=True)
 
             except Exception as e:
                 print(f"\n[!] decrypt error: {e}")
                 print("> ", end="", flush=True)
 
+
     # ============================================================
     # Processamento de mensagens recebidas
     # ============================================================
 
-    def _process_incoming_message_packet(self, data: dict):
+    def _process_incoming_message_packet(self, data: dict) -> None:
         hdr = data["hdr"]
         body = data["body"]
 
         peer_dh_pub = import_public_key(hdr["dh_pub_b64"])
+
         self.state.receive_header_and_ratchet_if_needed(peer_dh_pub)
 
         n = int(hdr["n"])
@@ -334,11 +362,22 @@ class SpectreClient:
             _ = self.state.receiving_chain.next_message_key()
 
         mk = self.state.receiving_chain.next_message_key()
-        pt = decrypt_with_message_key(mk, body["nonce_b64"], body["ct_b64"])
+
+        pt_bytes = decrypt_with_message_key(
+            mk,
+            body["nonce_b64"],
+            body["ct_b64"],
+        )
 
         sender = data.get("user", "peer")
-        print(f"\n[{sender} -> {self.user}] {pt.decode(errors='replace')}")
+        try:
+            text = pt_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            text = repr(pt_bytes)
+
+        print(f"\n[{sender} -> {self.user}] {text}")
         print("> ", end="", flush=True)
+
 
     # ============================================================
     # Bundle management
@@ -356,32 +395,18 @@ class SpectreClient:
     def _maybe_init_ratchet(self):
         """
         Inicializa o Double Ratchet via X3DH SE ainda não existir estado.
-        Se já existe self.state (carregado do disco), só sincroniza e processa fila.
+        Se já existe self.state (carregado do disco), não faz nada.
         """
-        # Já tenho estado salvo: só reusa
+        # Já tenho estado salvo: não mexo no ratchet
         if self.state is not None:
-            if self.peer_init_dh_pub is not None:
-                self.state.their_dh_pub = self.peer_init_dh_pub
-            print("[*] Ratchet already loaded from disk. Skipping X3DH.")
-            if self.pending_packets:
-                print(f"[*] Processing {len(self.pending_packets)} queued messages.")
-                queued = list(self.pending_packets)
-                self.pending_packets.clear()
-                for pkt in queued:
-                    try:
-                        self._process_incoming_message_packet(pkt)
-                    except Exception as e:
-                        print(f"[!] Error processing queued msg: {e}")
-            print("[*] Ratchet synchronized.")
             return
 
         # Ainda não temos o bundle completo do peer
         if not (self.peer_id_pub and self.peer_eph_pub and self.peer_init_dh_pub):
             return
 
-        # ---------- X3DH CORRETO ----------
+        # ---------- X3DH ----------
         if self.is_initiator:
-            # Mesma fórmula do x3dh.py (já implementada)
             shared = derive_shared_secret(
                 initiator_priv_id=self.identity_priv,
                 initiator_priv_eph=self.eph_priv,
@@ -389,26 +414,14 @@ class SpectreClient:
                 responder_pub_eph=self.peer_eph_pub,
             )
         else:
-            # Responder precisa reproduzir os MESMOS 3 DHs que o initiator combinou,
-            # mas usando SUAS privadas e as públicas do initiator.
-
-            # Queremos o mesmo vetor do initiator:
-            #   [ DH(I_A, I_B), DH(E_A, I_B), DH(I_A, E_B) ]
-            #
-            # Usando simetria do X25519:
-            #   DH(I_A, I_B) = DH(I_B, I_A)
-            #   DH(E_A, I_B) = DH(I_B, E_A)
-            #   DH(I_A, E_B) = DH(E_B, I_A)
-
             dh1 = dh(self.identity_priv, self.peer_id_pub)      # DH(I_B, I_A)
             dh2 = dh(self.identity_priv, self.peer_eph_pub)     # DH(I_B, E_A)
             dh3 = dh(self.eph_priv, self.peer_id_pub)           # DH(E_B, I_A)
-
             combined = dh1 + dh2 + dh3
             shared = kdf(combined)
 
         root_key = shared
-        # ----------------------------------
+        # --------------------------
 
         self.state = RatchetState(
             root_key=root_key,
@@ -432,6 +445,8 @@ class SpectreClient:
 
         print("[*] Ratchet synchronized.")
 
+
+
     # ============================================================
     # Socket connection
     # ============================================================
@@ -442,7 +457,7 @@ class SpectreClient:
         self.sio.connect(
             self.url,
             wait=True,
-            wait_timeout=500,
+            wait_timeout=50000,
             transports=["polling"],
         )
 
@@ -460,7 +475,7 @@ class SpectreClient:
             "password_hash_bcrypt": pwd_hash,
             "role": self.role_str,
         })
-        self._register_event.wait(timeout=500)
+        self._register_event.wait(timeout=50000)
         return self._register_success
 
     def login(self, pwd_hash: str) -> bool:
@@ -470,7 +485,7 @@ class SpectreClient:
             "password_hash_bcrypt": pwd_hash,
             "role": self.role_str,
         })
-        self._login_event.wait(timeout=500)
+        self._login_event.wait(timeout=50000)
         return self._login_success
 
     # ============================================================
@@ -584,14 +599,29 @@ def main():
     while True:
         msg = input("> ").rstrip("\n")
         if msg == "/quit":
+            try:
+                cli.sio.emit("leave", {
+                    "room": room,
+                    "user": user,
+                })
+                
+            except Exception as e:
+                print(f"[!] Erro ao enviar leave: {e}")
+
             if cli.state is not None:
-                save_ratchet_state_to_disk(cli.state, cli.user, cli.room)
+                try:
+                    save_ratchet_state_to_disk(cli.state, cli.user, cli.room)
+                except Exception as e:
+                    print(f"[!] Erro ao salvar estado: {e}")
+
             cli.sio.disconnect()
             break
+        
         elif msg == "/rotate":
             rotate_flag = True
             print("[*] Will rotate DH before next message.")
             continue
+        
         elif msg:
             cli.send_message(msg, rotate=rotate_flag)
             rotate_flag = False

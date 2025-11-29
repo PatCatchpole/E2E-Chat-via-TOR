@@ -1,190 +1,396 @@
-SpectreProtocol — Chat E2E via Tor (X3DH + Double Ratchet)
+# SpectreProtocol — Chat E2E via Tor (X3DH + Double Ratchet)
 
-Mensageiro ponta-a-ponta com X3DH para bootstrap e Double Ratchet para sigilo futuro/pós-comprometimento.
-Transporte em tempo real via Socket.IO e suporte a mensagens assíncronas (fila offline) via REST.
-Servidor atua como roteador cego: nunca vê plaintext.
+Mensageiro de texto com criptografia de ponta-a-ponta, usando:
 
-Hidden Service (.onion) já disponível:
+- **X3DH simplificado** para acordo de chaves iniciais  
+- **Double Ratchet** para sigilo futuro e pós-comprometimento (cada mensagem com uma chave distinta)  
+- **Transporte em tempo real** via Socket.IO (Python)  
+- **Persistência** em um back-end Spring Boot
 
-jvwjozfkejvf6ypklaf6b5j6723vbr6xcewu5frpjt3izxeeixejanad.onion
+Em produção, o tráfego pode ser exposto através de um **Hidden Service Tor (.onion)**.
 
-Fora de banda (QR): troca chave pública de identidade (IK) + metadados → autenticidade.
+---
 
-Em banda: apenas prekeys (SPK/OTK) e pacotes cifrados.
+## 1. Arquitetura
 
-Servidor: roteia tempo real, guarda ciphertext em fila e prekeys públicos.
+A aplicação é dividida em três partes:
 
-Stack
+- **Client (Python)**: CLI que o usuário executa, faz login/registro, realiza o X3DH, mantém o estado do Double Ratchet e cifra/decifra mensagens.  
+- **Server (Python)**: servidor Socket.IO que recebe pacotes dos clientes, fala com o back-end e faz o roteamento das mensagens. Não descriptografa nada.  
+- **Back-end (Java/Spring Boot)**: API interna que persiste usuários, salas, mensagens e bundles de chaves em um banco relacional.
 
-Cliente: Python 3.11+, pynacl, python-socketio, requests[socks]
+### 1.1 Estrutura de pastas
 
-Cripto: X25519 (X3DH simplificado), Double Ratchet, XSalsa20-Poly1305 (NaCl SecretBox)
+```text
+.
+├─ Server/
+│  └─ app.py
+│
+├─ Client/
+│  ├─ client_cli.py          # CLI principal
+│  └─ crypto/
+│     ├─ e2e.py              # Orquestra X3DH + Double Ratchet
+│     ├─ keys.py             # Geração/import/export de chaves
+│     ├─ message.py          # Encrypt/Decrypt de mensagens
+│     ├─ ratchet.py          # Double Ratchet
+│     └─ x3dh.py             # X3DH simplificado
+│
+└─ Back-end/
+   └─ spectre-chat/
+      └─ src/main/java/br/com/spectre/spectrechat/
+         ├─ controller/
+         │  ├─ InternalAuthController.java
+         │  ├─ InternalBundleController.java
+         │  ├─ InternalMessageController.java
+         │  └─ InternalRoomController.java
+         ├─ domain/
+         │  ├─ KeyBundle.java
+         │  ├─ Message.java
+         │  ├─ Room.java
+         │  ├─ RoomParticipant.java
+         │  └─ User.java
+         ├─ repository/
+         │  ├─ KeyBundleRepository.java
+         │  ├─ MessageRepository.java
+         │  ├─ RoomParticipantRepository.java
+         │  ├─ RoomRepository.java
+         │  └─ UserRepository.java
+         ├─ dto/
+         │  ├─ auth/
+         │  ├─ bundle/
+         │  ├─ message/
+         │  └─ room/
+         └─ config/
+            ├─ InternalTokenFilter.java
+            └─ SecurityConfig.java
+```
 
-Servidor: Flask + Flask-SocketIO + REST
+---
 
-Banco: PostgreSQL (SQLAlchemy)
+## 2. Visão geral das funcionalidades
 
-Tor: Hidden Service v3 (já publicado)
+### 2.1 Client (CLI em Python)
 
-Estrutura do projeto
-E2E-Chat-via-TOR/
-├─ client_cli.py
-├─ crypto/
-│  ├─ __init__.py
-│  ├─ keys.py
-│  ├─ x3dh.py
-│  ├─ ratchet.py
-│  └─ message.py
-└─ server/
-   ├─ app.py        # REST + relay Socket.IO
-   ├─ auth.py       # registro/login/token
-   └─ db.py         # modelos SQLAlchemy (PostgreSQL)
+Responsabilidades principais:
 
-Instalação
+- Interface de linha de comando para o usuário final
+- Registro e login:
+  - Envia `username` + hash de senha para o Server
+  - Server repassa para o back-end (`/internal/auth/register` e `/internal/auth/login`)
+- Geração e armazenamento local de:
+  - **Chave de identidade** de longo prazo (IK)
+  - Estado do **Double Ratchet** por sala (root key, cadeias de envio/recebimento, contadores)
+- Execução do **X3DH**:
+  - Usa chaves de identidade + chaves efêmeras locais e do peer
+  - Gera uma `root_key` inicial compartilhada
+- Execução do **Double Ratchet**:
+  - Rotação de DH periodicamente ou sob comando (`/rotate`)
+  - Cadeias de envio/recebimento gerando `message_key` de uso único
+- Criptografia de mensagens:
+  - Usa `message_key` + nonce aleatório
+  - Envia mensagem cifrada (header + body) ao Server
+- Persistência de estado:
+  - Arquivos em `~/.spectre/` (ou similar) guardando credenciais e estado do ratchet
+- Comandos da CLI (exemplos):
+  - Digitar texto → envia mensagem cifrada na sala
+  - `/rotate` → força nova rotação de DH
+  - `/quit` → sai da sala e encerra a sessão
 
-Crie venv e instale dependências:
+### 2.2 Server (Python – Flask + Socket.IO)
 
+Responsabilidades principais:
+
+- Expor o endpoint HTTP básico (health-check)  
+- Servir Socket.IO (`/socket.io`) para os clientes
+- Gerenciar sessões em memória:
+  - `sid` ↔ `user`, `userId`, `role`
+- Gerenciar salas:
+  - Cada sala mapeia `roomName -> participantes -> (sid, user, bundle)`
+- Integração com o back-end:
+  - Registro e login internos:
+    - `POST /internal/auth/register`
+    - `POST /internal/auth/login`
+  - Informações de sala:
+    - `POST /internal/rooms/join`
+    - `POST /internal/rooms/{room}/last-seen`
+  - Mensagens:
+    - `GET  /internal/rooms/{room}/messages` (backlog)
+    - `POST /internal/rooms/{room}/messages` (salvar nova mensagem)
+  - Bundles:
+    - `POST /internal/rooms/{room}/bundles` (armazenar bundle de chaves de um participante)
+- Troca de bundles:
+  - Primeiro cliente que entra na sala: bundle é armazenado
+  - Segundo cliente: server troca os bundles entre eles (evento `bundle`)
+- Encaminhamento de mensagens:
+  - Recebe do client (`packet`)
+  - Persiste no back-end (recebe `id` da mensagem)
+  - Reenvia para os demais participantes da sala com o `id`
+- Processamento de `seen`:
+  - Atualiza o último `lastSeenMessageId` de cada usuário na sala
+
+> O Server **nunca descriptografa** mensagens. Ele só repassa ciphertext e metadados.
+
+### 2.3 Back-end (Java / Spring Boot)
+
+Responsabilidades principais:
+
+- **Autenticação interna**:
+  - Controlada por `InternalAuthController` e DTOs de `auth/`
+  - Registra usuários e realiza login para o Server (não exposto ao público)
+- **Gestão de salas**:
+  - `Room`, `RoomParticipant` e DTOs em `room/`
+  - Controle de quem participa de qual sala
+  - Controle de `lastSeenMessageId` por usuário/sala
+- **Bundles de chaves**:
+  - `KeyBundle` + `KeyBundleRepository`
+  - `InternalBundleController` para salvar/consultar bundles de chaves por room/user
+- **Mensagens**:
+  - `Message` + `MessageRepository`
+  - `InternalMessageController` recebe mensagens cifradas do Server e as persiste
+  - Retorna backlog de mensagens para o Server quando um usuário entra em uma sala
+- **Camada de segurança interna**:
+  - `InternalTokenFilter`: valida um header como `X-Internal-Token`
+  - `SecurityConfig`: registra o filtro e libera apenas os endpoints internos necessários
+
+> O back-end não tem acesso às chaves de sessão do Double Ratchet, apenas guarda o que o Server manda: headers/bodies cifrados e bundles públicos.
+
+---
+
+## 3. Pré-requisitos
+
+### 3.1 Ferramentas
+
+- Python **3.11+**
+- Java **17+**
+- Maven ou Gradle (conforme o projeto do Spring Boot)
+- PostgreSQL (ou outro banco configurado no back-end)
+- Tor Browser (opcional, para uso via .onion)
+
+### 3.2 Dependências Python (Client + Server)
+
+No diretório raiz do projeto:
+
+```bash
 python -m venv .venv
+
 # Windows PowerShell
 . .\.venv\Scripts\Activate.ps1
+
 # Linux/macOS
 # source .venv/bin/activate
 
 pip install --upgrade pip
-pip install flask flask-socketio python-socketio pynacl requests[socks] \
-            sqlalchemy psycopg2-binary argon2-cffi itsdangerous
+pip install -r ./requirements.txt
+```
 
+---
 
-Crie um .env 
+## 4. Configuração do Back-end
 
-Configuração do PostgreSQL
+### 4.1 Banco de dados (exemplo PostgreSQL)
 
-Crie DB/usuário:
-
+```sql
 CREATE DATABASE spectre;
 CREATE USER spectre WITH ENCRYPTED PASSWORD 'SENHA_FORTE';
 GRANT ALL PRIVILEGES ON DATABASE spectre TO spectre;
+```
 
+Em `application.properties` ou `application.yml`, configurar algo como:
 
-Inicialize as tabelas:
+```properties
+spring.datasource.url=jdbc:postgresql://localhost:5432/spectre
+spring.datasource.username=spectre
+spring.datasource.password=SENHA_FORTE
 
-python -c "from server.db import create_all; create_all(); print('DB pronto')"
+spring.jpa.hibernate.ddl-auto=update
+# ou validate/none, dependendo de migrations
+server.port=8090
+```
 
+### 4.2 Token interno
 
-O servidor lê DATABASE_URL. Ajuste conforme seu ambiente.
+No back-end:
 
-Execução
-Servidor (uma máquina)
+- Configure o token esperado pelo `InternalTokenFilter` (ex.: `super-secreto-local`).
 
-Suba o backend (bind local para uso com .onion):
+No `Server/app.py`:
 
-python -m server.app
-# Esperado: Running on http://127.0.0.1:5000
+```python
+BACKEND_BASE_URL = "http://127.0.0.1:8090"
+INTERNAL_TOKEN = "super-secreto-local"
+```
 
+O filtro deve validar algo como:
 
-O Hidden Service Tor já está configurado e aponta para 127.0.0.1:5000.
-Não é necessário alterar o torrc para usar o endereço abaixo.
+- Header: `X-Internal-Token: super-secreto-local`
 
-Cliente (cada máquina que vai conversar)
+### 4.3 Rodar o back-end
 
-Abra o Tor Browser (deixa SOCKS em 127.0.0.1:9150).
+Na pasta `Back-end/spectre-chat`:
 
-Rode o cliente:
+```bash
+mvn spring-boot:run
+# ou rodar pela IDE
+```
 
+---
+
+## 5. Configuração do Server (Python)
+
+Na pasta `Server/`:
+
+1. Ajustar se necessário:
+
+   ```python
+   BACKEND_BASE_URL = "http://127.0.0.1:8090"
+   INTERNAL_TOKEN = "super-secreto-local"
+   ```
+
+2. Rodar:
+
+   ```bash
+   cd Server
+   python app.py
+   ```
+
+3. Verificar no navegador:
+
+   - Acessar `http://127.0.0.1:5000/`  
+   - Deve aparecer uma resposta simples de health-check.
+
+---
+
+## 6. Configuração do Client (Python)
+
+Na pasta `Client/`:
+
+```bash
+cd Client
 python client_cli.py
-# Room: qualquer (apenas rótulo de transporte)
-# Your name: alice|bob
-# Role [i/r]: i ou r
-# Onion host: jvwjozfkejvf6ypklaf6b5j6723vbr6xcewu5frpjt3izxeeixejanad
+```
 
+Entrada típica na CLI:
 
-Cole somente o host (sem http://, sem porta). O cliente monta http://<host>.onion e usa HTTP polling via SOCKS (estável no Tor).
+- `Room name:` nome da sala (ex.: `spectre`)
+- `Your name:` nome de usuário (ex.: `alice`)
+- `Senha de <user>:` senha local (usada para gerar/validar hash Bcrypt)
+- `Role [i=initiator / r=responder]:` papel na sessão:
+  - `i` inicia o X3DH
+  - `r` responde
+- `Onion host (leave blank for localhost):`
+  - Deixe em branco para usar `http://127.0.0.1:5000`
+  - Informe o host `.onion` para usar através da Tor (sem `http://`)
 
-Fluxo de uso
+O client:
 
-Troca automatica fora de banda a chave pública de identidade (IK) + metadados (bundle).
+1. Gera (ou carrega) chaves de identidade e arquivos de estado.  
+2. Tenta login no back-end via Server; se o usuário não existir, tenta registro e login.  
+3. Efetua `join` na sala.  
+4. Recebe/entrega bundles de chaves e inicializa X3DH + Double Ratchet.
 
-Compare o fingerprint da IK em ambos os lados (TOFU).
+---
 
-2) Sessão síncrona (ambos online)
+## 7. Execução local (sem Tor)
 
-X3DH → root_key.
+Passo a passo:
 
-Double Ratchet inicia; mensagens fluem via Socket.IO (por .onion).
+1. **Subir o banco e o back-end**
 
-3) Mensagens assíncronas (destinatário offline)
+   ```bash
+   # PostgreSQL já em execução
+   cd Back-end/spectre-chat
+   mvn spring-boot:run
+   # back-end em http://127.0.0.1:8090
+   ```
 
-Destinatário: /login → /publish-prekeys (publica SPK + OTKs).
+2. **Subir o Server**
 
-Remetente (destinatário offline): /start-async <peer>
+   ```bash
+   cd Server
+   python app.py
+   # server em http://127.0.0.1:5000
+   ```
 
-GET /prekeys/<peer> → recebe SPK (+ 1 OTK).
+3. **Abrir dois terminais para os Clients**
 
-Roda X3DH (usando IK do QR, não do servidor) → root_key.
+   Terminal 1:
 
-Envia prekey message para /queue/<peer>.
+   ```bash
+   cd Client
+   python client_cli.py
 
-Destinatário ao voltar: /login → /inbox → processa prekey message, reconstrói root_key, inicia o ratchet e lê mensagens.
+   Room name: spectre
+   Your name: alice
+   Senha de alice: ********
+   Role [i=initiator / r=responder]: i
+   Onion host (leave blank for localhost):
+   ```
 
-Comandos no CLI:
+   Terminal 2:
 
-/rotate
-Rotates double rachet
+   ```bash
+   cd Client
+   python client_cli.py
 
+   Room name: spectre
+   Your name: bob
+   Senha de bob: ********
+   Role [i=initiator / r/responder]: r
+   Onion host (leave blank for localhost):
+   ```
 
-/quit
-quits chat
+4. **Troca de mensagens**
 
-Endpoints REST
-Método & Rota	Auth	Descrição
-POST /register	—	Cria usuário (username, password, identity_fingerprint opcional).
-POST /login	—	Retorna bearer token (token).
-POST /prekeys	Bearer	Publica spk_pub_b64 e otk_pub_b64[] (opcional).
-GET /prekeys/<id>	—	Retorna SPK e consome 1 OTK. Recomenda-se <id> = fingerprint da IK.
-POST /queue/<id>	—	Enfileira pacote cifrado para <id>.
-GET /queue	Bearer	Entrega e remove pacotes pendentes do usuário logado.
+   - Digite mensagens em cada terminal → aparecem descriptografadas no outro.  
+   - Use `/rotate` para rotacionar a chave DH.  
+   - Use `/quit` para sair.
 
-Melhor prática: vincule username → fingerprint no cadastro e use fingerprint como chave primária de roteamento (evita colisões).
+---
 
-Segurança (resumo)
+## 8. Execução via Tor (.onion)
 
-E2E real: servidor não possui chaves de sessão e não vê plaintext.
+Pré-requisitos:
 
-X3DH: bootstrap com IK (via QR) + prekeys (SPK/OTK) em banda.
+- Tor Browser ou serviço Tor em execução localmente (SOCKS5 em `127.0.0.1:9150`)  
+- Hidden Service configurado apontando para `127.0.0.1:5000` (Server)
 
-Double Ratchet: sigilo futuro e pós-comprometimento.
+Passos:
 
-AEAD: XSalsa20-Poly1305; cabeçalho pode ser associado como AD (opcional no message.py).
+1. Subir back-end e Server normalmente (localhost).  
+2. Iniciar o Tor Browser.  
+3. Rodar o Client:
 
-Fila offline: armazena somente ciphertext, com TTL e limite de tamanho.
+   ```bash
+   cd Client
+   python client_cli.py
 
-Login: senhas com Argon2id, token assinado.
+   Room name: spectre
+   Your name: alice
+   Senha de alice: ********
+   Role [i=initiator / r/responder]: i
+   Onion host (leave blank for localhost): <host_onion_sem_http>
+   ```
 
-Identidade fora do servidor: IK pública não é servida pelo backend; autenticidade vem do QR.
+O client monta algo como `http://<host>.onion:80` e usa `requests` com proxy SOCKS5 (`127.0.0.1:9150`).
 
-Trabalhos futuros sugeridos: assinatura do SPK verificada com IK do QR, buffer de mensagens fora de ordem, persistência cifrada do estado do ratchet, quotas/limites por conta/IP.
+---
 
-Problemas comuns
+## 9. Problemas comuns
 
-“Connection refused / 10061”
+- **401 Unauthorized do back-end**
+  - Token interno do `Server` diferente do configurado no `InternalTokenFilter`
+  - Header incorreto (`X-Internal-Token` com valor errado)
 
-No cliente: mantenha o Tor Browser aberto (SOCKS 127.0.0.1:9150).
+- **Cliente não consegue conectar ao Server**
+  - Verificar se o Server está rodando na porta correta (`5000`)
+  - Verificar se o host `.onion` está correto (via Tor)
 
-O servidor deve estar ouvindo 127.0.0.1:5000.
+- **Erro ao descriptografar mensagens**
+  - Ratchet desincronizado (por exemplo, arquivos de estado corrompidos)
+  - Arquivo de estado antigo → possível solução: apagar o estado da sala e reiniciar sessão
 
-Use o host .onion sem http:// no prompt do cliente.
+---
 
-No module named crypto
+## 10. Licença
 
-Execute sempre da raiz do projeto; garanta crypto/__init__.py.
-
-Falha ao descriptografar
-
-Ratchet: avance a receiving chain até n; só faça DH-ratchet quando dh_pub mudar.
-
-Se AD estiver habilitado, use o mesmo header no encrypt/decrypt.
-
-Licença
-
-Defina a licença (MIT/Apache-2.0/etc).
-
+(Definir a licença aqui — ex.: MIT, Apache 2.0 etc.)

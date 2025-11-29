@@ -8,22 +8,6 @@ Hidden Service (.onion) já disponível:
 
 jvwjozfkejvf6ypklaf6b5j6723vbr6xcewu5frpjt3izxeeixejanad.onion
 
-
-Arquitetura
-+-----------------+        .onion         +----------------------+
-|  Client CLI     | <--- (SOCKS5h) ---->  |  Relay + REST (Flask)|
-|  X3DH + Ratchet |                       |  Socket.IO + Postgres|
-+-----------------+                       +----------------------+
-        ^                                         |
-        | (fora de banda) QR                      | (somente dados públicos)
-        | identidade pública + meta               v
-+-----------------+                       +----------------------+
-|  Client CLI     |                       |  PostgreSQL          |
-|  X3DH + Ratchet |                       |  users, prekeys,     |
-+-----------------+                       |  otks, queue         |
-                                          +----------------------+
-
-
 Fora de banda (QR): troca chave pública de identidade (IK) + metadados → autenticidade.
 
 Em banda: apenas prekeys (SPK/OTK) e pacotes cifrados.
@@ -71,11 +55,7 @@ pip install flask flask-socketio python-socketio pynacl requests[socks] \
             sqlalchemy psycopg2-binary argon2-cffi itsdangerous
 
 
-Crie um .env (opcional) ou exporte variáveis:
-
-DATABASE_URL=postgresql+psycopg2://spectre:SENHA_FORTE@localhost:5432/spectre
-SPECTRE_SECRET=troque_por_um_segredo_longo_e_aleatorio
-FLASK_ENV=production
+Crie um .env 
 
 Configuração do PostgreSQL
 
@@ -121,9 +101,8 @@ python client_cli.py
 Cole somente o host (sem http://, sem porta). O cliente monta http://<host>.onion e usa HTTP polling via SOCKS (estável no Tor).
 
 Fluxo de uso
-1) Pareamento inicial (autenticidade via QR/manual)
 
-Troque fora de banda a chave pública de identidade (IK) + metadados (bundle).
+Troca automatica fora de banda a chave pública de identidade (IK) + metadados (bundle).
 
 Compare o fingerprint da IK em ambos os lados (TOFU).
 
@@ -149,17 +128,12 @@ Destinatário ao voltar: /login → /inbox → processa prekey message, reconstr
 
 Comandos no CLI:
 
-/login — autentica no backend (token)
+/rotate
+Rotates double rachet
 
-/showbundle / /paste — QR/manual
 
-/publish-prekeys — publica SPK/OTKs do destinatário
-
-/start-async <peer> — inicia sessão com peer offline
-
-/inbox — busca fila offline
-
-/rotate — força DH ratchet antes do próximo envio
+/quit
+quits chat
 
 Endpoints REST
 Método & Rota	Auth	Descrição
@@ -213,3 +187,4 @@ Se AD estiver habilitado, use o mesmo header no encrypt/decrypt.
 Licença
 
 Defina a licença (MIT/Apache-2.0/etc).
+

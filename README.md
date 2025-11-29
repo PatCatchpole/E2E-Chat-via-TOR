@@ -236,6 +236,7 @@ mvn spring-boot:run
 ---
 
 ## 5. Configuração do Server (Python)
+Para estar 100% funcional é necessário estar na rede Tor. (Conectado no Tor Browser ou semelhante)
 
 Na pasta `Server/`:
 
@@ -384,13 +385,10 @@ O client monta algo como `http://<host>.onion:80` e usa `requests` com proxy SOC
 - **Cliente não consegue conectar ao Server**
   - Verificar se o Server está rodando na porta correta (`5000`)
   - Verificar se o host `.onion` está correto (via Tor)
+  - Reiniciar o Tor Browser, o Server e o Back-end normalmente resolvem.
 
 - **Erro ao descriptografar mensagens**
   - Ratchet desincronizado (por exemplo, arquivos de estado corrompidos)
   - Arquivo de estado antigo → possível solução: apagar o estado da sala e reiniciar sessão
 
 ---
-
-## 10. Licença
-
-(Definir a licença aqui — ex.: MIT, Apache 2.0 etc.)

@@ -273,7 +273,7 @@ python client_cli.py
 Entrada típica na CLI:
 
 - `Room name:` nome da sala (ex.: `spectre`)
-- `Your name:` nome de usuário (ex.: `alice`)
+- `Your name:` nome de usuário (ex.: qualquer)
 - `Senha de <user>:` senha local (usada para gerar/validar hash Bcrypt)
 - `Role [i=initiator / r=responder]:` papel na sessão:
   - `i` inicia o X3DH
@@ -390,5 +390,6 @@ O client monta algo como `http://<host>.onion:80` e usa `requests` com proxy SOC
 - **Erro ao descriptografar mensagens**
   - Ratchet desincronizado (por exemplo, arquivos de estado corrompidos)
   - Arquivo de estado antigo → possível solução: apagar o estado da sala e reiniciar sessão
+
 
 ---

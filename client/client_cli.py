@@ -81,9 +81,14 @@ def main():
         answer = prompt("Role - [i]nitiator sends first, [r]esponder replies", "i")
         is_initiator = not answer.lower().startswith("r")
 
-    onion = args.onion if args.onion is not None else prompt(
-        "Onion host (blank for localhost)", ""
-    )
+    if args.onion:
+        onion = args.onion
+    elif args.url:
+        # An explicit relay URL answers the question; do not ask it again.
+        onion = ""
+    else:
+        onion = prompt("Onion host (blank for localhost)", "")
+
     if onion:
         url, use_tor = normalise_onion(onion), True
     else:

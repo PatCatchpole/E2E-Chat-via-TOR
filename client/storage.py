@@ -120,7 +120,13 @@ def load_state(user: str, room: str):
 
 
 def save_state(user: str, room: str, snapshot: dict) -> None:
-    _write_private(state_path(user, room), json.dumps(snapshot).encode("utf-8"))
+    # The room and user are recorded inside the file as well as in its name,
+    # because _safe_name is lossy -- the original name cannot be recovered from
+    # the filename, and the room list needs it.
+    payload = dict(snapshot)
+    payload.setdefault("room", room)
+    payload.setdefault("user", user)
+    _write_private(state_path(user, room), json.dumps(payload).encode("utf-8"))
 
 
 def clear_state(user: str, room: str) -> None:
@@ -142,5 +148,46 @@ def load_known_peer(user: str, room: str):
 def save_known_peer(user: str, room: str, peer_user: str, identity_b64: str) -> None:
     _write_private(
         peer_path(user, room),
-        json.dumps({"user": peer_user, "identity": identity_b64}).encode("utf-8"),
+        json.dumps({
+            "user": peer_user,
+            "identity": identity_b64,
+            "room": room,
+            "owner": user,
+        }).encode("utf-8"),
     )
+
+
+def list_rooms(user: str) -> list:
+    """
+    Rooms this user has an established session for, newest first.
+
+    Derived from local state, so it needs no backend support and reveals
+    nothing to the relay. Returns dicts of {room, peer, last_used}.
+    """
+    ensure_dirs()
+    prefix = _safe_name(user) + "__"
+    found = {}
+
+    for directory in (PEERS_DIR, STATE_DIR):
+        for path in directory.glob(f"{prefix}*.json"):
+            data = _read_json(path)
+            if not isinstance(data, dict):
+                continue
+            room = data.get("room")
+            if not room:
+                # Written before the room was recorded inside the file; recover
+                # what we can from the filename.
+                stem = path.name[len(prefix):]
+                room = stem[:-5] if stem.endswith(".json") else stem
+            if not room:
+                continue
+
+            entry = found.setdefault(room, {"room": room, "peer": None, "last_used": 0.0})
+            if data.get("user") and directory is PEERS_DIR:
+                entry["peer"] = data["user"]
+            try:
+                entry["last_used"] = max(entry["last_used"], path.stat().st_mtime)
+            except OSError:
+                pass
+
+    return sorted(found.values(), key=lambda e: e["last_used"], reverse=True)

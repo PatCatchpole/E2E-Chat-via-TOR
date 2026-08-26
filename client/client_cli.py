@@ -1,8 +1,9 @@
 """
 Spectre client entry point.
 
-Collects connection details, brings up the session, then hands control to the
-full-screen chat UI.
+By default this runs a sign-in screen and a room picker, then hands over to the
+chat UI. `--classic` falls back to plain stdin prompts, which is what scripts
+and pipes want.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from ui import ChatUI
 LOCAL_HOST = os.environ.get("SPECTRE_RELAY_HOST", "127.0.0.1")
 LOCAL_PORT = os.environ.get("SPECTRE_RELAY_PORT", "5000")
 LOCAL_URL = f"http://{LOCAL_HOST}:{LOCAL_PORT}"
+DEFAULT_RELAY = f"{LOCAL_HOST}:{LOCAL_PORT}"
 
 
 def parse_args():
@@ -27,7 +29,7 @@ def parse_args():
         prog="spectre",
         description="End-to-end encrypted chat over Tor.",
     )
-    parser.add_argument("--room", help="room name")
+    parser.add_argument("--room", help="room name (skips the room picker)")
     parser.add_argument("--user", help="your username")
     parser.add_argument("--onion", help="onion host of the relay (without http://)")
     parser.add_argument("--url", help=f"relay URL for local use (default {LOCAL_URL})")
@@ -41,6 +43,11 @@ def parse_args():
         action="store_true",
         help="discard the saved session for this room and handshake again",
     )
+    parser.add_argument(
+        "--classic",
+        action="store_true",
+        help="use plain text prompts instead of the full-screen screens",
+    )
     return parser.parse_args()
 
 
@@ -51,54 +58,136 @@ def prompt(label, default=None):
 
 
 def normalise_onion(host):
-    """Accept 'abc', 'abc.onion' or 'http://abc.onion' and build a URL."""
+    """
+    Accept 'abc', 'abc.onion', 'abc.onion:8080' or 'http://abc.onion/' and
+    build a URL.
+
+    The port has to be split off before the '.onion' suffix is stripped;
+    otherwise 'abc.onion:80' keeps its suffix and gets a second one appended.
+    """
     host = host.strip()
     for prefix in ("http://", "https://"):
         if host.startswith(prefix):
             host = host[len(prefix):]
     host = host.rstrip("/")
+
+    port = "80"
+    if ":" in host:
+        host, _, given = host.rpartition(":")
+        if given.isdigit():
+            port = given
+        else:                       # not a port after all; put it back
+            host = f"{host}:{given}"
+
     if host.endswith(".onion"):
         host = host[: -len(".onion")]
-    return f"http://{host}.onion:80"
+    return f"http://{host}.onion:{port}"
+
+
+def resolve_relay(text: str):
+    """
+    Turn whatever was typed into (url, use_tor).
+
+    Accepts 'host:port', 'http://host:port' and '<hash>.onion'.
+    """
+    text = (text or "").strip()
+    if not text:
+        return LOCAL_URL, False
+    if ".onion" in text:
+        return normalise_onion(text), True
+    if text.startswith("http://") or text.startswith("https://"):
+        return text.rstrip("/"), False
+    return f"http://{text}", False
+
+
+def classic_details(args):
+    """Plain prompts, for scripts and for when the full-screen UI is unwanted."""
+    print("Spectre -- end-to-end encrypted chat\n")
+
+    user = args.user or prompt("Username", "user")
+    password = getpass(f"Password for {user}: ")
+    if not password:
+        sys.exit("A password is required.")
+
+    if args.role:
+        role = args.role
+    else:
+        answer = prompt("Role - [i]nitiator sends first, [r]esponder replies", "i")
+        role = "responder" if answer.lower().startswith("r") else "initiator"
+
+    if args.onion:
+        url, use_tor = normalise_onion(args.onion), True
+    elif args.url:
+        url, use_tor = args.url, False
+    else:
+        onion = prompt("Onion host (blank for localhost)", "")
+        url, use_tor = (normalise_onion(onion), True) if onion else (LOCAL_URL, False)
+
+    room = args.room or prompt("Room", "spectre")
+    return {"user": user, "password": password, "role": role,
+            "url": url, "use_tor": use_tor, "room": room}
+
+
+def screen_details(args):
+    """
+    Sign-in screen, then the room picker.
+
+    Same shape as `classic_details`, or None if the user backed out. Backing out
+    of the room picker returns to sign in rather than quitting.
+    """
+    import screens
+
+    if args.onion:
+        relay_default = args.onion
+    elif args.url:
+        relay_default = args.url
+    else:
+        relay_default = DEFAULT_RELAY
+
+    message = ""
+    username = args.user or ""
+    role = args.role or "initiator"
+
+    while True:
+        credentials = screens.login_screen(
+            relay=relay_default, username=username, role=role, message=message,
+        )
+        if credentials is None:
+            return None
+
+        username = credentials["user"]
+        role = credentials["role"]
+        relay_default = credentials["relay"]
+        url, use_tor = resolve_relay(credentials["relay"])
+
+        if args.room:
+            room = args.room
+        else:
+            room = screens.room_screen(username, storage.list_rooms(username))
+            if room is None:
+                message = ""
+                continue        # back to sign in
+
+        return {"user": username, "password": credentials["password"], "role": role,
+                "url": url, "use_tor": use_tor, "room": room}
 
 
 def main():
     args = parse_args()
     storage.ensure_dirs()
 
-    print("Spectre -- end-to-end encrypted chat\n")
-
-    room = args.room or prompt("Room", "spectre")
-    user = args.user or prompt("Username", "user")
-
-    password = getpass(f"Password for {user}: ")
-    if not password:
-        sys.exit("A password is required.")
-
-    if args.role:
-        is_initiator = args.role == "initiator"
-    else:
-        answer = prompt("Role - [i]nitiator sends first, [r]esponder replies", "i")
-        is_initiator = not answer.lower().startswith("r")
-
-    if args.onion:
-        onion = args.onion
-    elif args.url:
-        # An explicit relay URL answers the question; do not ask it again.
-        onion = ""
-    else:
-        onion = prompt("Onion host (blank for localhost)", "")
-
-    if onion:
-        url, use_tor = normalise_onion(onion), True
-    else:
-        url, use_tor = args.url or LOCAL_URL, False
+    # The full-screen screens need a real terminal; piped input falls back to
+    # plain prompts so scripts keep working.
+    use_screens = not args.classic and sys.stdin.isatty() and sys.stdout.isatty()
+    details = screen_details(args) if use_screens else classic_details(args)
+    if details is None:
+        return
 
     if args.reset:
-        storage.clear_state(user, room)
-        print("Saved session for this room discarded.")
+        storage.clear_state(details["user"], details["room"])
+        print(f"Saved session for '{details['room']}' discarded.")
 
-    print(f"\nConnecting to {url} ...")
+    print(f"\nConnecting to {details['url']} ...")
 
     ui_holder = {}
 
@@ -110,18 +199,17 @@ def main():
             print(f"  {payload.get('text', '')}")
 
     session = SpectreSession(
-        url=url, room=room, user=user, password=password,
-        is_initiator=is_initiator, use_tor=use_tor, on_event=on_event,
+        url=details["url"], room=details["room"], user=details["user"],
+        password=details["password"], is_initiator=details["role"] == "initiator",
+        use_tor=details["use_tor"], on_event=on_event,
     )
 
     try:
         session.connect()
     except Exception as e:
-        sys.exit(
-            f"Could not reach the relay at {url}: {e}\n"
-            + ("Is Tor running and listening on 127.0.0.1:9150?"
-               if use_tor else "Is the relay running?")
-        )
+        hint = ("Is Tor running and listening on 127.0.0.1:9150?"
+                if details["use_tor"] else "Is the relay running?")
+        sys.exit(f"Could not reach the relay at {details['url']}: {e}\n{hint}")
 
     session.start()
 
@@ -133,7 +221,8 @@ def main():
 
     session.join()
 
-    ui = ChatUI(session, room=room, user=user, use_tor=use_tor)
+    ui = ChatUI(session, room=details["room"], user=details["user"],
+                use_tor=details["use_tor"])
     ui_holder["ui"] = ui
 
     try:

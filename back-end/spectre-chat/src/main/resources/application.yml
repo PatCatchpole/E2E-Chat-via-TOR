@@ -3,9 +3,11 @@ spring:
     name: spectre-chat
 
   datasource:
-    url: jdbc:postgresql://localhost:5432/spectre_chat
-    username: spectre_user
-    password: spectre_admin
+    # Credentials come from the environment. Nothing here should be a working
+    # secret -- this file is in version control.
+    url: ${SPECTRE_DB_URL:jdbc:postgresql://localhost:5432/spectre_chat}
+    username: ${SPECTRE_DB_USER:spectre_user}
+    password: ${SPECTRE_DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
 
   jpa:
@@ -14,11 +16,24 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
+    open-in-view: false
     show-sql: false
 
   flyway:
     enabled: true
     locations: classpath:db/migration
 
+spectre:
+  # Shared secret for /internal/**. No default: the app refuses to start
+  # without it, so a deployment cannot silently fall back to a known token.
+  internal-token: ${SPECTRE_INTERNAL_TOKEN}
+
 server:
-  port: 8090
+  port: ${SPECTRE_BACKEND_PORT:8090}
+  # Bind to loopback only. The internal API is for the relay on the same host,
+  # never for the network.
+  address: 127.0.0.1
+
+logging:
+  level:
+    br.com.spectre.spectrechat: INFO

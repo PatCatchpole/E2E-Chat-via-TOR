@@ -8,6 +8,8 @@ import br.com.spectre.spectrechat.dto.message.SaveMessageInternalRequest;
 import br.com.spectre.spectrechat.repository.MessageRepository;
 import br.com.spectre.spectrechat.repository.RoomRepository;
 import br.com.spectre.spectrechat.repository.UserRepository;
+import br.com.spectre.spectrechat.error.NotFoundException;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,10 +42,10 @@ public class InternalMessageController {
     @PostMapping("/{keyword}/messages")
     public ResponseEntity<MessageDTO> saveMessage(
             @PathVariable String keyword,
-            @RequestBody SaveMessageInternalRequest req) throws Exception {
+            @Valid @RequestBody SaveMessageInternalRequest req) throws Exception {
 
         Room room = roomRepo.findByKeyword(keyword)
-                .orElseThrow(() -> new RuntimeException("Room inexistente"));
+                .orElseThrow(() -> new NotFoundException("No such room: " + keyword));
 
         User sender = null;
         if (req.user() != null && !req.user().isBlank()) {
@@ -80,7 +82,7 @@ public class InternalMessageController {
             @RequestParam(required = false) Long sinceId) {
 
         Room room = roomRepo.findByKeyword(keyword)
-                .orElseThrow(() -> new RuntimeException("Room inexistente"));
+                .orElseThrow(() -> new NotFoundException("No such room: " + keyword));
 
         List<Message> msgs = (sinceId == null)
                 ? msgRepo.findByRoomOrderByIdAsc(room)

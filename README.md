@@ -1,395 +1,279 @@
-# SpectreProtocol — Chat E2E via Tor (X3DH + Double Ratchet)
+# SpectreProtocol — End-to-end encrypted chat over Tor
 
-Mensageiro de texto com criptografia de ponta-a-ponta, usando:
+Two-party text chat using X3DH for key agreement and the Double Ratchet for
+forward secrecy and post-compromise security, relayed over Socket.IO and
+optionally exposed as a Tor hidden service.
 
-- **X3DH simplificado** para acordo de chaves iniciais  
-- **Double Ratchet** para sigilo futuro e pós-comprometimento (cada mensagem com uma chave distinta)  
-- **Transporte em tempo real** via Socket.IO (Python)  
-- **Persistência** em um back-end Spring Boot
-
-Em produção, o tráfego pode ser exposto através de um **Hidden Service Tor (.onion)**.
+> **Status: a learning project, not a vetted messenger.** The cryptography is
+> hand-rolled against the published specifications rather than delegated to a
+> reviewed library. It has a test suite covering the protocol properties, but it
+> has not been audited. Do not use it to protect anything that matters.
 
 ---
 
-## 1. Arquitetura
+## 1. Architecture
 
-A aplicação é dividida em três partes:
+Three processes:
 
-- **Client (Python)**: CLI que o usuário executa, faz login/registro, realiza o X3DH, mantém o estado do Double Ratchet e cifra/decifra mensagens.  
-- **Server (Python)**: servidor Socket.IO que recebe pacotes dos clientes, fala com o back-end e faz o roteamento das mensagens. Não descriptografa nada.  
-- **Back-end (Java/Spring Boot)**: API interna que persiste usuários, salas, mensagens e bundles de chaves em um banco relacional.
+| Component | Language | Role |
+|---|---|---|
+| `client/` | Python | CLI. Holds all key material, runs X3DH and the Double Ratchet, encrypts and decrypts. |
+| `server/` | Python | Socket.IO relay. Routes ciphertext, never holds a session key. |
+| `back-end/` | Java / Spring Boot | Persists users, rooms, key bundles and ciphertext in Postgres. |
 
-### 1.1 Estrutura de pastas
+The relay and the backend see ciphertext and metadata only. Neither can read a
+message, but both see who talks to whom and when — see [Threat model](#7-threat-model).
+
+```
+client  <--- Socket.IO (Tor) --->  relay  <--- HTTP (loopback) --->  backend  ---> Postgres
+```
+
+### Layout
 
 ```text
-.
-├─ Server/
-│  └─ app.py
-│
-├─ Client/
-│  ├─ client_cli.py          # CLI principal
-│  └─ crypto/
-│     ├─ e2e.py              # Orquestra X3DH + Double Ratchet
-│     ├─ keys.py             # Geração/import/export de chaves
-│     ├─ message.py          # Encrypt/Decrypt de mensagens
-│     ├─ ratchet.py          # Double Ratchet
-│     └─ x3dh.py             # X3DH simplificado
-│
-└─ Back-end/
-   └─ spectre-chat/
-      └─ src/main/java/br/com/spectre/spectrechat/
-         ├─ controller/
-         │  ├─ InternalAuthController.java
-         │  ├─ InternalBundleController.java
-         │  ├─ InternalMessageController.java
-         │  └─ InternalRoomController.java
-         ├─ domain/
-         │  ├─ KeyBundle.java
-         │  ├─ Message.java
-         │  ├─ Room.java
-         │  ├─ RoomParticipant.java
-         │  └─ User.java
-         ├─ repository/
-         │  ├─ KeyBundleRepository.java
-         │  ├─ MessageRepository.java
-         │  ├─ RoomParticipantRepository.java
-         │  ├─ RoomRepository.java
-         │  └─ UserRepository.java
-         ├─ dto/
-         │  ├─ auth/
-         │  ├─ bundle/
-         │  ├─ message/
-         │  └─ room/
-         └─ config/
-            ├─ InternalTokenFilter.java
-            └─ SecurityConfig.java
+client/
+  client_cli.py       entry point, argument and prompt handling
+  session.py          transport, handshake, message dispatch
+  ui.py               full-screen terminal chat interface
+  storage.py          0600 local persistence for keys and ratchet state
+  crypto/
+    kdf.py            HKDF-SHA256 (RFC 5869)
+    keys.py           identities, signed prekey bundles, safety numbers
+    x3dh.py           key agreement
+    ratchet.py        Double Ratchet
+    message.py        XChaCha20-Poly1305 AEAD
+    state.py          ratchet serialisation
+    password.py       PBKDF2 password verifier
+server/app.py         Socket.IO relay
+tests/                protocol test suite
+back-end/spectre-chat Spring Boot service
 ```
 
 ---
 
-## 2. Visão geral das funcionalidades
+## 2. Requirements
 
-### 2.1 Client (CLI em Python)
-
-Responsabilidades principais:
-
-- Interface de linha de comando para o usuário final
-- Registro e login:
-  - Envia `username` + hash de senha para o Server
-  - Server repassa para o back-end (`/internal/auth/register` e `/internal/auth/login`)
-- Geração e armazenamento local de:
-  - **Chave de identidade** de longo prazo (IK)
-  - Estado do **Double Ratchet** por sala (root key, cadeias de envio/recebimento, contadores)
-- Execução do **X3DH**:
-  - Usa chaves de identidade + chaves efêmeras locais e do peer
-  - Gera uma `root_key` inicial compartilhada
-- Execução do **Double Ratchet**:
-  - Rotação de DH periodicamente ou sob comando (`/rotate`)
-  - Cadeias de envio/recebimento gerando `message_key` de uso único
-- Criptografia de mensagens:
-  - Usa `message_key` + nonce aleatório
-  - Envia mensagem cifrada (header + body) ao Server
-- Persistência de estado:
-  - Arquivos em `~/.spectre/` (ou similar) guardando credenciais e estado do ratchet
-- Comandos da CLI (exemplos):
-  - Digitar texto → envia mensagem cifrada na sala
-  - `/rotate` → força nova rotação de DH
-  - `/quit` → sai da sala e encerra a sessão
-
-### 2.2 Server (Python – Flask + Socket.IO)
-
-Responsabilidades principais:
-
-- Expor o endpoint HTTP básico (health-check)  
-- Servir Socket.IO (`/socket.io`) para os clientes
-- Gerenciar sessões em memória:
-  - `sid` ↔ `user`, `userId`, `role`
-- Gerenciar salas:
-  - Cada sala mapeia `roomName -> participantes -> (sid, user, bundle)`
-- Integração com o back-end:
-  - Registro e login internos:
-    - `POST /internal/auth/register`
-    - `POST /internal/auth/login`
-  - Informações de sala:
-    - `POST /internal/rooms/join`
-    - `POST /internal/rooms/{room}/last-seen`
-  - Mensagens:
-    - `GET  /internal/rooms/{room}/messages` (backlog)
-    - `POST /internal/rooms/{room}/messages` (salvar nova mensagem)
-  - Bundles:
-    - `POST /internal/rooms/{room}/bundles` (armazenar bundle de chaves de um participante)
-- Troca de bundles:
-  - Primeiro cliente que entra na sala: bundle é armazenado
-  - Segundo cliente: server troca os bundles entre eles (evento `bundle`)
-- Encaminhamento de mensagens:
-  - Recebe do client (`packet`)
-  - Persiste no back-end (recebe `id` da mensagem)
-  - Reenvia para os demais participantes da sala com o `id`
-- Processamento de `seen`:
-  - Atualiza o último `lastSeenMessageId` de cada usuário na sala
-
-> O Server **nunca descriptografa** mensagens. Ele só repassa ciphertext e metadados.
-
-### 2.3 Back-end (Java / Spring Boot)
-
-Responsabilidades principais:
-
-- **Autenticação interna**:
-  - Controlada por `InternalAuthController` e DTOs de `auth/`
-  - Registra usuários e realiza login para o Server (não exposto ao público)
-- **Gestão de salas**:
-  - `Room`, `RoomParticipant` e DTOs em `room/`
-  - Controle de quem participa de qual sala
-  - Controle de `lastSeenMessageId` por usuário/sala
-- **Bundles de chaves**:
-  - `KeyBundle` + `KeyBundleRepository`
-  - `InternalBundleController` para salvar/consultar bundles de chaves por room/user
-- **Mensagens**:
-  - `Message` + `MessageRepository`
-  - `InternalMessageController` recebe mensagens cifradas do Server e as persiste
-  - Retorna backlog de mensagens para o Server quando um usuário entra em uma sala
-- **Camada de segurança interna**:
-  - `InternalTokenFilter`: valida um header como `X-Internal-Token`
-  - `SecurityConfig`: registra o filtro e libera apenas os endpoints internos necessários
-
-> O back-end não tem acesso às chaves de sessão do Double Ratchet, apenas guarda o que o Server manda: headers/bodies cifrados e bundles públicos.
+- Python 3.9+
+- Java 21 and Maven (the backend targets Spring Boot 4)
+- PostgreSQL
+- Tor, for `.onion` operation (Tor Browser, or a `tor` daemon)
 
 ---
 
-## 3. Pré-requisitos
+## 3. Configuration
 
-### 3.1 Ferramentas
+Nothing secret is committed. Both the relay and the backend read their
+configuration from the environment and **refuse to start without it** rather
+than falling back to a default.
 
-- Python **3.11+**
-- Java **17+**
-- Maven ou Gradle (conforme o projeto do Spring Boot)
-- PostgreSQL (ou outro banco configurado no back-end)
-- Tor Browser (opcional, para uso via .onion)
-
-### 3.2 Dependências Python (Client + Server)
-
-No diretório raiz do projeto:
+Generate the shared token once:
 
 ```bash
-python -m venv .venv
-
-# Windows PowerShell
-. .\.venv\Scripts\Activate.ps1
-
-# Linux/macOS
-# source .venv/bin/activate
-
-pip install --upgrade pip
-pip install -r ./requirements.txt
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `SPECTRE_INTERNAL_TOKEN` | relay + backend | Shared secret for `/internal/**`. Must match on both. |
+| `SPECTRE_DB_PASSWORD` | backend | Postgres password. |
+| `SPECTRE_DB_URL`, `SPECTRE_DB_USER` | backend | Default to `localhost:5432/spectre_chat` and `spectre_user`. |
+| `SPECTRE_BACKEND_URL` | relay | Defaults to `http://127.0.0.1:8090`. |
+| `SPECTRE_RELAY_HOST`, `SPECTRE_RELAY_PORT` | relay | Default `127.0.0.1:5000`. |
+| `SPECTRE_CORS_ORIGINS` | relay | Comma-separated browser origins. Empty by default; the CLI does not need it. |
+| `SPECTRE_ALLOW_DEV_SERVER` | relay | Set to `1` to run the Werkzeug dev server non-interactively (systemd, docker). |
+| `SPECTRE_LOG_LEVEL` | relay | Defaults to `INFO`. |
 
 ---
 
-## 4. Configuração do Back-end
+## 4. Running locally
 
-### 4.1 Banco de dados (exemplo PostgreSQL)
+**Database**
 
 ```sql
-CREATE DATABASE spectre;
-CREATE USER spectre WITH ENCRYPTED PASSWORD 'SENHA_FORTE';
-GRANT ALL PRIVILEGES ON DATABASE spectre TO spectre;
+CREATE DATABASE spectre_chat;
+CREATE USER spectre_user WITH ENCRYPTED PASSWORD 'choose-a-strong-one';
+GRANT ALL PRIVILEGES ON DATABASE spectre_chat TO spectre_user;
 ```
 
-Em `application.properties` ou `application.yml`, configurar algo como:
+Flyway applies the schema on first start; `ddl-auto` is `validate`, so the
+migrations in `src/main/resources/db/migration` are the single source of truth.
 
-```properties
-spring.datasource.url=jdbc:postgresql://localhost:5432/spectre
-spring.datasource.username=spectre
-spring.datasource.password=SENHA_FORTE
-
-spring.jpa.hibernate.ddl-auto=update
-# ou validate/none, dependendo de migrations
-server.port=8090
-```
-
-### 4.2 Token interno
-
-No back-end:
-
-- Configure o token esperado pelo `InternalTokenFilter` (ex.: `super-secreto-local`).
-
-No `Server/app.py`:
-
-```python
-BACKEND_BASE_URL = "http://127.0.0.1:8090"
-INTERNAL_TOKEN = "super-secreto-local"
-```
-
-O filtro deve validar algo como:
-
-- Header: `X-Internal-Token: super-secreto-local`
-
-### 4.3 Rodar o back-end
-
-Na pasta `Back-end/spectre-chat`:
+**Backend**
 
 ```bash
-mvn spring-boot:run
-# ou rodar pela IDE
+cd back-end/spectre-chat
+export SPECTRE_INTERNAL_TOKEN='<token>'
+export SPECTRE_DB_PASSWORD='choose-a-strong-one'
+mvn spring-boot:run          # listens on 127.0.0.1:8090
 ```
 
----
-
-## 5. Configuração do Server (Python)
-Para estar 100% funcional é necessário estar na rede Tor. (Conectado no Tor Browser ou semelhante)
-
-Na pasta `Server/`:
-
-1. Ajustar se necessário:
-
-   ```python
-   BACKEND_BASE_URL = "http://127.0.0.1:8090"
-   INTERNAL_TOKEN = "super-secreto-local"
-   ```
-
-2. Rodar:
-
-   ```bash
-   cd Server
-   python app.py
-   ```
-
-3. Verificar no navegador:
-
-   - Acessar `http://127.0.0.1:5000/`  
-   - Deve aparecer uma resposta simples de health-check.
-
----
-
-## 6. Configuração do Client (Python)
-
-Na pasta `Client/`:
+**Relay**
 
 ```bash
-cd Client
-python client_cli.py
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+export SPECTRE_INTERNAL_TOKEN='<token>'   # the same value
+python server/app.py
 ```
 
-Entrada típica na CLI:
+**Clients** — two terminals:
 
-- `Room name:` nome da sala (ex.: `spectre`)
-- `Your name:` nome de usuário (ex.: qualquer)
-- `Senha de <user>:` senha local (usada para gerar/validar hash Bcrypt)
-- `Role [i=initiator / r=responder]:` papel na sessão:
-  - `i` inicia o X3DH
-  - `r` responde
-- `Onion host (leave blank for localhost):`
-  - Deixe em branco para usar `http://127.0.0.1:5000`
-  - Informe o host `.onion` para usar através da Tor (sem `http://`)
+```bash
+cd client
+python client_cli.py --room spectre --user alice --role initiator
+python client_cli.py --room spectre --user bob   --role responder
+```
 
-O client:
+The initiator sends the first message; the responder cannot send until it has
+received one, because its sending chain does not exist until then. Run without
+flags to be prompted instead.
 
-1. Gera (ou carrega) chaves de identidade e arquivos de estado.  
-2. Tenta login no back-end via Server; se o usuário não existir, tenta registro e login.  
-3. Efetua `join` na sala.  
-4. Recebe/entrega bundles de chaves e inicializa X3DH + Double Ratchet.
+### Windows
 
----
+Only the client needs to run on Windows; the relay and backend can stay on
+another machine. Paths and the interpreter differ from the examples above:
 
-## 7. Execução local (sem Tor)
+```cmd
+git clone <repo> && cd E2E-Chat-via-TOR
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 
-Passo a passo:
+cd client
+..\.venv\Scripts\python client_cli.py --room spectre --user alice --url http://<relay-host>:5055
+```
 
-1. **Subir o banco e o back-end**
+The interpreter lives in `.venv\Scripts\`, not `.venv/bin/`. Installing the
+requirements globally instead of in a venv also works — then it is just
+`python client_cli.py ...`.
 
-   ```bash
-   # PostgreSQL já em execução
-   cd Back-end/spectre-chat
-   mvn spring-boot:run
-   # back-end em http://127.0.0.1:8090
-   ```
+Set variables with `set` rather than `export`:
 
-2. **Subir o Server**
+```cmd
+set SPECTRE_RELAY_PORT=5055
+```
 
-   ```bash
-   cd Server
-   python app.py
-   # server em http://127.0.0.1:5000
-   ```
+Use Windows Terminal or PowerShell if you can; the full-screen interface
+renders poorly in legacy `cmd.exe`.
 
-3. **Abrir dois terminais para os Clients**
+Key material goes to `%USERPROFILE%\.spectre\`. The 0600 permissions the
+client applies on Unix have no equivalent there — Windows has no POSIX mode
+bits — so those files are protected by the ACL on your user profile directory
+and nothing more.
 
-   Terminal 1:
-
-   ```bash
-   cd Client
-   python client_cli.py
-
-   Room name: spectre
-   Your name: alice
-   Senha de alice: ********
-   Role [i=initiator / r=responder]: i
-   Onion host (leave blank for localhost):
-   ```
-
-   Terminal 2:
-
-   ```bash
-   cd Client
-   python client_cli.py
-
-   Room name: spectre
-   Your name: bob
-   Senha de bob: ********
-   Role [i=initiator / r/responder]: r
-   Onion host (leave blank for localhost):
-   ```
-
-4. **Troca de mensagens**
-
-   - Digite mensagens em cada terminal → aparecem descriptografadas no outro.  
-   - Use `/rotate` para rotacionar a chave DH.  
-   - Use `/quit` para sair.
+> **macOS:** AirPlay Receiver listens on port 5000 and will answer the relay's
+> requests with `403`. Either turn it off in System Settings → General →
+> AirDrop & Handoff, or set `SPECTRE_RELAY_PORT` to something else.
 
 ---
 
-## 8. Execução via Tor (.onion)
+## 5. Using the chat screen
 
-Pré-requisitos:
+```
+ SPECTRE #spectre  alice <-> bob   online  tor
+ 09:11 bob: hey, did the handshake land?
+ 09:11 alice: yes - safety number matches what you read out
+ verified  safety 04100 56204 84454 71388 ...   sent 7  recv 5
+> _
+```
 
-- Tor Browser ou serviço Tor em execução localmente (SOCKS5 em `127.0.0.1:9150`)  
-- Hidden Service configurado apontando para `127.0.0.1:5000` (Server)
+| Command | Effect |
+|---|---|
+| `/verify` | Print the full 60-digit safety number and mark the peer verified. |
+| `/trust` | Accept a changed peer identity key, after re-verifying out of band. |
+| `/clear` | Clear the transcript. |
+| `/help` | Command list. |
+| `/quit` | Leave the room and exit. |
 
-Passos:
+`PageUp` / `PageDown` scroll the transcript. `Ctrl-C` exits.
 
-1. Subir back-end e Server normalmente (localhost).  
-2. Iniciar o Tor Browser.  
-3. Rodar o Client:
+### Verifying a peer
 
-   ```bash
-   cd Client
-   python client_cli.py
+Signature checks stop the relay forging a bundle, but they cannot tell you the
+identity key you received is the one you expect. Run `/verify` on both sides and
+compare the digits over a channel the relay does not control. Until you do, the
+status bar reads `unverified`.
 
-   Room name: spectre
-   Your name: alice
-   Senha de alice: ********
-   Role [i=initiator / r/responder]: i
-   Onion host (leave blank for localhost): <host_onion_sem_http>
-   ```
+If a peer's identity key ever changes, the client refuses the new one and warns.
+That is either a reinstall or an interception attempt; confirm which out of band
+before running `/trust`.
 
-O client monta algo como `http://<host>.onion:80` e usa `requests` com proxy SOCKS5 (`127.0.0.1:9150`).
+---
+
+## 6. Running via Tor
+
+Add to your `torrc`:
+
+```
+HiddenServiceDir /var/lib/tor/spectre/
+HiddenServicePort 80 127.0.0.1:5000
+```
+
+Read the hostname from `/var/lib/tor/spectre/hostname`, then:
+
+```bash
+cd client
+python client_cli.py --onion <host>.onion
+```
+
+The client proxies through SOCKS5 at `127.0.0.1:9150` (Tor Browser). For a
+standalone `tor` daemon, change `TOR_SOCKS_PORT` in `client/session.py` to 9050.
+Hostname resolution goes through `socks5h`, so `.onion` lookups stay inside Tor.
 
 ---
 
-## 9. Problemas comuns
+## 7. Threat model
 
-- **401 Unauthorized do back-end**
-  - Token interno do `Server` diferente do configurado no `InternalTokenFilter`
-  - Header incorreto (`X-Internal-Token` com valor errado)
+**Protected against**
 
-- **Cliente não consegue conectar ao Server**
-  - Verificar se o Server está rodando na porta correta (`5000`)
-  - Verificar se o host `.onion` está correto (via Tor)
-  - Reiniciar o Tor Browser, o Server e o Back-end normalmente resolvem.
+- A malicious relay or backend reading messages. They hold ciphertext only.
+- A relay forging or altering a key bundle. Every published key is signed by its
+  identity key, bound to the user and room.
+- A relay tampering with message headers. The header is authenticated as AEAD
+  associated data.
+- Injection or impersonation by other clients. The relay takes the sender from
+  its own session and requires room membership.
+- Past messages after a key compromise, and future messages after the ratchet
+  recovers, given continued two-way traffic.
 
-- **Erro ao descriptografar mensagens**
-  - Ratchet desincronizado (por exemplo, arquivos de estado corrompidos)
-  - Arquivo de estado antigo → possível solução: apagar o estado da sala e reiniciar sessão
+**Not protected against**
 
+- **Metadata.** The relay and backend see who talks to whom, when, and how
+  often. Message rows are never deleted. Tor hides network location, not this.
+- **An unverified identity key.** Signatures prove a bundle is self-consistent,
+  not that it belongs to your peer. Only `/verify` establishes that.
+- **A compromised endpoint.** Ratchet state on disk is 0600 but not encrypted at
+  rest; anyone who can read your files can read your session.
+- **Traffic analysis.** No padding, no cover traffic; message sizes and timing
+  are visible.
 
 ---
+
+## 8. Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+The suite covers the protocol properties directly: out-of-order and dropped
+messages, both peers ratcheting simultaneously, save/restore across a restart,
+replay and stale-chain rejection, forged header counters, tampered headers and
+ciphertext, bundle signature forgery, and safety number stability.
+
+---
+
+## 9. Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| Relay exits with `SPECTRE_INTERNAL_TOKEN is not set` | Export it. There is deliberately no default. |
+| `401` from the backend | The token differs between relay and backend. |
+| Relay exits refusing to start non-interactively | Set `SPECTRE_ALLOW_DEV_SERVER=1`, or front it with a real WSGI server. |
+| `403` connecting to the relay on macOS | AirPlay Receiver owns port 5000. See §4. |
+| `AttributeError: can't set attribute` in the relay | Flask-SocketIO older than 5.4 against Flask ≥ 3.1. Reinstall from `requirements.txt`. |
+| `Could not restore the saved session` | State file from an older format; it is discarded and a fresh handshake runs. |
+| Peer identity change warning | Reinstall or interception. Verify out of band, then `/trust`. |
+| Responder cannot send | Expected until it receives the first message. |
+
+To start a room over, delete the saved state: `python client_cli.py --reset`.

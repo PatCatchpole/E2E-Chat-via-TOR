@@ -7,6 +7,8 @@ import br.com.spectre.spectrechat.dto.bundle.SaveBundleInternalRequest;
 import br.com.spectre.spectrechat.repository.KeyBundleRepository;
 import br.com.spectre.spectrechat.repository.RoomRepository;
 import br.com.spectre.spectrechat.repository.UserRepository;
+import br.com.spectre.spectrechat.error.NotFoundException;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -32,13 +34,13 @@ public class InternalBundleController {
     @PostMapping("/{keyword}/bundles")
     public ResponseEntity<?> saveBundle(
             @PathVariable String keyword,
-            @RequestBody SaveBundleInternalRequest req) throws Exception {
+            @Valid @RequestBody SaveBundleInternalRequest req) throws Exception {
 
         User user = userRepo.findByUsername(req.user())
-                .orElseThrow(() -> new RuntimeException("Usuário inexistente"));
+                .orElseThrow(() -> new NotFoundException("No such user: " + req.user()));
 
         Room room = roomRepo.findByKeyword(keyword)
-                .orElseThrow(() -> new RuntimeException("Room inexistente"));
+                .orElseThrow(() -> new NotFoundException("No such room: " + keyword));
 
         String json = mapper.writeValueAsString(req.bundle());
 

@@ -1,117 +1,261 @@
-from nacl.public import PrivateKey, PublicKey
-from nacl.bindings import crypto_scalarmult
-from nacl.hash import blake2b
-from nacl.encoding import RawEncoder
+"""
+Double Ratchet.
+
+This follows the published algorithm rather than the bespoke variant that was
+here before. The previous version derived a "base seed" per root step and split
+it into SEND/RECV chains by role, kept no skipped-message keys, and exposed a
+manual rotate operation that the algorithm does not have. That last one was the
+source of the desync: rotating twice without sending in between left the peer
+unable to reach the new root key.
+
+Structure per the spec:
+
+  RK          root key
+  DHs / DHr   our current DH key pair / the peer's latest DH public key
+  CKs / CKr   sending and receiving chain keys
+  Ns / Nr     message counters within the current chains
+  PN          length of the previous sending chain
+  skipped     message keys for messages that have not arrived yet
+
+The DH ratchet advances by itself: every message carries the sender's current
+DH public key, and seeing a new one triggers a rotation on the receiver. There
+is deliberately no public rotate method.
+"""
+
+from __future__ import annotations
+
+import base64
 import hmac
-import hashlib
+import json
 
-def dh(private_key: PrivateKey, public_key: PublicKey) -> bytes:
-    """X25519 DH => 32-byte shared secret."""
-    return crypto_scalarmult(private_key.encode(), public_key.encode())
+from nacl.exceptions import CryptoError
+from nacl.public import PrivateKey
 
-def kdf_chain(chain_key: bytes) -> (bytes, bytes):
-    """
-    Symmetric-chain ratchet:
-    Returns (next_chain_key, one_time_message_key)
-    """
-    next_chain_key = hmac.new(chain_key, b"chain", hashlib.sha256).digest()
-    message_key    = hmac.new(chain_key, b"msg",   hashlib.sha256).digest()
-    return next_chain_key, message_key
+from crypto.kdf import hkdf
+from crypto.message import decrypt as aead_decrypt
+from crypto.message import encrypt as aead_encrypt
+from crypto.x3dh import dh
 
-def kdf_root(root_key: bytes, dh_output: bytes) -> (bytes, bytes):
-    """
-    Root-key KDF:
-    Returns (new_root_key, base_chain_key_seed)
-    """
-    combined = root_key + dh_output
-    new_root_key  = blake2b(combined + b"root",  encoder=RawEncoder)
-    base_chain    = blake2b(combined + b"base",  encoder=RawEncoder)
-    return new_root_key, base_chain
+ROOT_INFO = b"SpectreProtocol/root/v1"
+HEADER_AD = b"SpectreProtocol/header/v1"
 
-def kdf_direction(seed: bytes, label: bytes) -> bytes:
-    """
-    Split base chain into directional send/recv chain keys deterministically.
-    """
-    return blake2b(seed + label, encoder=RawEncoder)
+CHAIN_STEP = b"\x01"
+MESSAGE_KEY_STEP = b"\x02"
 
-class ChainState:
-    def __init__(self, chain_key: bytes):
-        self.chain_key = chain_key
-        self.index = 0
+# An out-of-order or lost message is normal; a header claiming a counter far
+# ahead of the current one is not. Without this bound a forged header drives an
+# unbounded key-derivation loop on the receiver.
+MAX_SKIP = 1000
 
-    def next_message_key(self) -> bytes:
-        self.chain_key, message_key = kdf_chain(self.chain_key)
-        self.index += 1
-        return message_key
+# Total skipped keys retained across all chains, so a peer that keeps opening
+# gaps cannot grow our state without limit.
+MAX_SKIPPED_KEYS = 2000
 
-class RatchetState:
+
+class RatchetError(Exception):
+    """Raised for any message this ratchet refuses to accept."""
+
+
+def _kdf_rk(root_key: bytes, dh_output: bytes) -> tuple:
+    """Root KDF: returns (new_root_key, chain_key)."""
+    derived = hkdf(dh_output, info=ROOT_INFO, salt=root_key, length=64)
+    return derived[:32], derived[32:]
+
+
+def _kdf_ck(chain_key: bytes) -> tuple:
+    """Chain KDF: returns (next_chain_key, message_key)."""
+    next_ck = hmac.new(chain_key, CHAIN_STEP, "sha256").digest()
+    message_key = hmac.new(chain_key, MESSAGE_KEY_STEP, "sha256").digest()
+    return next_ck, message_key
+
+
+def _header_bytes(header: dict) -> bytes:
     """
-    Holds:
-      - root_key
-      - our current DH keypair
-      - their current DH public key (last seen)
-      - sending_chain / receiving_chain
-      - is_initiator: assigns who starts with which direction
+    Canonical encoding of the header, used as AEAD associated data. Sorted keys
+    and no whitespace so both peers derive byte-identical input.
     """
-    def __init__(self, root_key: bytes, dh_keypair: PrivateKey, their_dh_pub: PublicKey, *, is_initiator: bool):
+    encoded = json.dumps(header, sort_keys=True, separators=(",", ":")).encode()
+    return HEADER_AD + encoded
+
+
+class DoubleRatchet:
+    def __init__(self, root_key, dh_pair, peer_dh_public, sending_chain, receiving_chain):
         self.root_key = root_key
-        self.dh_keypair = dh_keypair
-        self.their_dh_pub = their_dh_pub
-        self.is_initiator = is_initiator
+        self.dh_pair = dh_pair
+        self.peer_dh_public = peer_dh_public
+        self.sending_chain = sending_chain
+        self.receiving_chain = receiving_chain
+        self.send_count = 0
+        self.recv_count = 0
+        self.previous_chain_length = 0
+        self.skipped = {}  # (peer_dh_public, n) -> message key
+        # Peer DH keys we have already ratcheted past. A packet carrying one of
+        # these is stale -- a backlog replay or a relay re-sending an old
+        # message -- and must never be mistaken for a new key.
+        self.retired_dh = set()
 
-        dh_out = dh(self.dh_keypair, self.their_dh_pub)
-        self.root_key, base_seed = kdf_root(self.root_key, dh_out)
+    # ---- initial state ------------------------------------------------
 
-        if self.is_initiator:
-            send_ck = kdf_direction(base_seed, b"SEND")
-            recv_ck = kdf_direction(base_seed, b"RECV")
-        else:
-            send_ck = kdf_direction(base_seed, b"RECV")
-            recv_ck = kdf_direction(base_seed, b"SEND")
-
-        self.sending_chain   = ChainState(send_ck)
-        self.receiving_chain = ChainState(recv_ck)
-
-    def receive_header_and_ratchet_if_needed(self, peer_dh_pub: PublicKey):
+    @classmethod
+    def initiator(cls, shared_secret: bytes, peer_signed_prekey: bytes) -> "DoubleRatchet":
         """
-        On receiving a packet, check if peer rotated DH.
-        If so, perform RECEIVE-SIDE DH ratchet:
-          1) Derive receiving chain using OLD local priv + NEW remote pub
-          2) Update their_dh_pub to the new one
-          3) Rotate our local DH and derive a fresh SENDING chain
+        The initiator can send immediately: it performs the first root step
+        against the responder's signed prekey.
         """
-        if peer_dh_pub.encode() == self.their_dh_pub.encode():
-            return  # no DH change; keep current chains
+        dh_pair = PrivateKey.generate()
+        root_key, sending_chain = _kdf_rk(shared_secret, dh(dh_pair, peer_signed_prekey))
+        return cls(root_key, dh_pair, peer_signed_prekey, sending_chain, None)
 
-        # 1) New receiving chain from old local priv and new peer pub
-        dh_out_recv = dh(self.dh_keypair, peer_dh_pub)
-        self.root_key, base_seed = kdf_root(self.root_key, dh_out_recv)
-
-        # Directional split for receiving chain after peer’s rotation:
-        # The direction labels remain consistent with our role.
-        recv_ck = kdf_direction(base_seed, b"RECV" if self.is_initiator else b"SEND")
-        self.receiving_chain = ChainState(recv_ck)
-
-        # Update stored peer pub now
-        self.their_dh_pub = peer_dh_pub
-
-        # 2) Rotate our local DH and prepare a NEW sending chain
-        self.dh_keypair = PrivateKey.generate()
-        dh_out_send = dh(self.dh_keypair, self.their_dh_pub)
-        self.root_key, base_seed2 = kdf_root(self.root_key, dh_out_send)
-        send_ck = kdf_direction(base_seed2, b"SEND" if self.is_initiator else b"RECV")
-        self.sending_chain = ChainState(send_ck)
-
-    def initiate_sending_ratchet(self) -> PublicKey:
+    @classmethod
+    def responder(cls, shared_secret: bytes, signed_prekey_private: PrivateKey) -> "DoubleRatchet":
         """
-        When WE decide to rotate before sending:
-          - Generate new local DH
-          - Derive a new SENDING chain against current peer DH pub
-          - Return our new pub for the message header
+        The responder starts with no chains at all. Its first inbound message
+        establishes both, which is why `encrypt` refuses to run before then.
         """
-        self.dh_keypair = PrivateKey.generate()
-        dh_out = dh(self.dh_keypair, self.their_dh_pub)
-        self.root_key, base_seed = kdf_root(self.root_key, dh_out)
-        send_ck = kdf_direction(base_seed, b"SEND" if self.is_initiator else b"RECV")
-        self.sending_chain = ChainState(send_ck)
-        return self.dh_keypair.public_key
+        return cls(shared_secret, signed_prekey_private, None, None, None)
+
+    # ---- introspection ------------------------------------------------
+
+    def sending_public_bytes(self) -> bytes:
+        return self.dh_pair.public_key.encode()
+
+    def can_send(self) -> bool:
+        return self.sending_chain is not None
+
+    # ---- sending ------------------------------------------------------
+
+    def encrypt(self, plaintext: bytes) -> dict:
+        if self.sending_chain is None:
+            raise RatchetError(
+                "no sending chain yet; the responder must receive one message "
+                "before it can send"
+            )
+
+        self.sending_chain, message_key = _kdf_ck(self.sending_chain)
+        header = {
+            "dh": base64.b64encode(self.sending_public_bytes()).decode(),
+            "pn": self.previous_chain_length,
+            "n": self.send_count,
+        }
+        self.send_count += 1
+
+        nonce, ciphertext = aead_encrypt(message_key, plaintext, _header_bytes(header))
+        return {
+            "hdr": header,
+            "body": {
+                "nonce": base64.b64encode(nonce).decode(),
+                "ct": base64.b64encode(ciphertext).decode(),
+            },
+        }
+
+    # ---- receiving ----------------------------------------------------
+
+    def decrypt(self, packet: dict) -> bytes:
+        header, nonce, ciphertext = self._parse(packet)
+        peer_dh = base64.b64decode(header["dh"])
+        n = header["n"]
+        associated_data = _header_bytes(header)
+
+        # A message we had already skipped past and stored a key for.
+        stored = self.skipped.pop((peer_dh, n), None)
+        if stored is not None:
+            return self._open(stored, nonce, ciphertext, associated_data)
+
+        if peer_dh in self.retired_dh:
+            # We already ratcheted past this chain and have no stored key for
+            # this counter, so the message is a duplicate of one consumed
+            # earlier. Rejecting here is essential: falling through would
+            # ratchet against a superseded key and rebuild both chains from a
+            # stale root, breaking everything that follows.
+            raise RatchetError(
+                "message belongs to a previous DH chain and was already "
+                "processed (stale replay)"
+            )
+
+        if peer_dh != self.peer_dh_public:
+            self._skip_to(header["pn"])
+            self._dh_ratchet(peer_dh)
+        elif n < self.recv_count:
+            raise RatchetError(
+                f"message {n} on this chain was already processed (replay or duplicate)"
+            )
+
+        self._skip_to(n)
+
+        if self.receiving_chain is None:
+            raise RatchetError("no receiving chain established")
+
+        self.receiving_chain, message_key = _kdf_ck(self.receiving_chain)
+        self.recv_count += 1
+        return self._open(message_key, nonce, ciphertext, associated_data)
+
+    # ---- internals ----------------------------------------------------
+
+    @staticmethod
+    def _parse(packet: dict) -> tuple:
+        try:
+            header = packet["hdr"]
+            body = packet["body"]
+            nonce = base64.b64decode(body["nonce"].encode())
+            ciphertext = base64.b64decode(body["ct"].encode())
+            if not isinstance(header["n"], int) or not isinstance(header["pn"], int):
+                raise RatchetError("header counters must be integers")
+            if header["n"] < 0 or header["pn"] < 0:
+                raise RatchetError("header counters must not be negative")
+            base64.b64decode(header["dh"])
+        except RatchetError:
+            raise
+        except Exception as exc:
+            raise RatchetError(f"malformed packet: {exc}") from exc
+        return header, nonce, ciphertext
+
+    @staticmethod
+    def _open(message_key, nonce, ciphertext, associated_data) -> bytes:
+        try:
+            return aead_decrypt(message_key, nonce, ciphertext, associated_data)
+        except CryptoError as exc:
+            raise RatchetError(
+                "authentication failed: the message or its header was altered"
+            ) from exc
+
+    def _skip_to(self, until: int) -> None:
+        """
+        Derive and retain the message keys for everything between the current
+        counter and `until`, so those messages can still be read when they
+        arrive. Bounded to keep a forged counter from becoming a denial of
+        service.
+        """
+        if until <= self.recv_count:
+            return
+        if until - self.recv_count > MAX_SKIP:
+            raise RatchetError(
+                f"header claims {until - self.recv_count} skipped messages, "
+                f"limit is {MAX_SKIP}"
+            )
+        if self.receiving_chain is None:
+            raise RatchetError("cannot skip messages without a receiving chain")
+
+        while self.recv_count < until:
+            self.receiving_chain, message_key = _kdf_ck(self.receiving_chain)
+            self.skipped[(self.peer_dh_public, self.recv_count)] = message_key
+            self.recv_count += 1
+
+        self._trim_skipped()
+
+    def _trim_skipped(self) -> None:
+        # dicts preserve insertion order, so this drops the oldest first.
+        while len(self.skipped) > MAX_SKIPPED_KEYS:
+            self.skipped.pop(next(iter(self.skipped)))
+
+    def _dh_ratchet(self, peer_dh: bytes) -> None:
+        """One full DH ratchet step: new receiving chain, then new sending chain."""
+        self.previous_chain_length = self.send_count
+        self.send_count = 0
+        self.recv_count = 0
+        if self.peer_dh_public is not None:
+            self.retired_dh.add(self.peer_dh_public)
+        self.peer_dh_public = peer_dh
+
+        self.root_key, self.receiving_chain = _kdf_rk(self.root_key, dh(self.dh_pair, peer_dh))
+        self.dh_pair = PrivateKey.generate()
+        self.root_key, self.sending_chain = _kdf_rk(self.root_key, dh(self.dh_pair, peer_dh))

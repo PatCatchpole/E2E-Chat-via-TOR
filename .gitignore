@@ -1,3 +1,29 @@
+# Python
 __pycache__/
 *.pyc
 venv/
+.venv/
+
+# Java / Maven
+target/
+back-end/**/target/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# --- Secrets: never commit key material or local state ---
+client/crypto/identity_key
+client/crypto/ephemeral_key
+*.key
+*.pem
+identity_key
+ephemeral_key
+*.cred
+*.state.json
+.env
+
+# Local dev config (contains a token)
+dev.env

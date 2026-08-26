@@ -33,6 +33,14 @@ public class Message {
     @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "sender_id")
     private User sender; // opcional (pode ser null)
 
+    /**
+     * Who this copy is encrypted for. One plaintext becomes one row per
+     * recipient, so this is what separates the copies. Null means the row
+     * predates group support and goes to everyone.
+     */
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "recipient_id")
+    private User recipient;
+
     @Column(name = "header_json", nullable = false, columnDefinition = "TEXT")
     private String headerJson;
 

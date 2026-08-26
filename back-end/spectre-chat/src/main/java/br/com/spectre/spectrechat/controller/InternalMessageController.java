@@ -21,6 +21,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.data.repository.query.Param;
 import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.ObjectMapper;
 
@@ -52,12 +53,20 @@ public class InternalMessageController {
             sender = userRepo.findByUsername(req.user()).orElse(null);
         }
 
+        User recipient = null;
+        if (req.recipient() != null && !req.recipient().isBlank()) {
+            recipient = userRepo.findByUsername(req.recipient())
+                    .orElseThrow(() -> new NotFoundException(
+                            "No such recipient: " + req.recipient()));
+        }
+
         String headerJson = mapper.writeValueAsString(req.header());
         String bodyJson   = mapper.writeValueAsString(req.body());
 
         Message m = Message.builder()
                 .room(room)
                 .sender(sender)
+                .recipient(recipient)
                 .headerJson(headerJson)
                 .bodyJson(bodyJson)
                 .createdAt(Instant.now())
@@ -65,13 +74,7 @@ public class InternalMessageController {
 
         Message saved = msgRepo.save(m);
 
-        MessageDTO dto = new MessageDTO(
-                saved.getId(),
-                saved.getSender() != null ? saved.getSender().getUsername() : null,
-                saved.getHeaderJson(),
-                saved.getBodyJson(),
-                saved.getCreatedAt()
-        );
+        MessageDTO dto = toDto(saved);
 
         return ResponseEntity.status(HttpStatus.CREATED).body(dto);
     }
@@ -79,25 +82,37 @@ public class InternalMessageController {
     @GetMapping("/{keyword}/messages")
     public ResponseEntity<List<MessageDTO>> listMessages(
             @PathVariable String keyword,
-            @RequestParam(required = false) Long sinceId) {
+            @RequestParam(required = false) Long sinceId,
+            @RequestParam(required = false) String recipient) {
 
         Room room = roomRepo.findByKeyword(keyword)
                 .orElseThrow(() -> new NotFoundException("No such room: " + keyword));
 
-        List<Message> msgs = (sinceId == null)
-                ? msgRepo.findByRoomOrderByIdAsc(room)
-                : msgRepo.findByRoomAndIdGreaterThanOrderByIdAsc(room, sinceId);
+        List<Message> msgs;
+        if (recipient == null || recipient.isBlank()) {
+            msgs = (sinceId == null)
+                    ? msgRepo.findByRoomOrderByIdAsc(room)
+                    : msgRepo.findByRoomAndIdGreaterThanOrderByIdAsc(room, sinceId);
+        } else {
+            User target = userRepo.findByUsername(recipient)
+                    .orElseThrow(() -> new NotFoundException(
+                            "No such recipient: " + recipient));
+            msgs = (sinceId == null)
+                    ? msgRepo.findForRecipient(room, target)
+                    : msgRepo.findForRecipientSince(room, target, sinceId);
+        }
 
-        List<MessageDTO> result = msgs.stream()
-                .map(m -> new MessageDTO(
-                        m.getId(),
-                        m.getSender() != null ? m.getSender().getUsername() : null,
-                        m.getHeaderJson(),
-                        m.getBodyJson(),
-                        m.getCreatedAt()
-                ))
-                .toList();
+        return ResponseEntity.ok(msgs.stream().map(this::toDto).toList());
+    }
 
-        return ResponseEntity.ok(result);
+    private MessageDTO toDto(Message m) {
+        return new MessageDTO(
+                m.getId(),
+                m.getSender() != null ? m.getSender().getUsername() : null,
+                m.getRecipient() != null ? m.getRecipient().getUsername() : null,
+                m.getHeaderJson(),
+                m.getBodyJson(),
+                m.getCreatedAt()
+        );
     }
 }

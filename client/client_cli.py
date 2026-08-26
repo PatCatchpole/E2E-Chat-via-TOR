@@ -34,11 +34,6 @@ def parse_args():
     parser.add_argument("--onion", help="onion host of the relay (without http://)")
     parser.add_argument("--url", help=f"relay URL for local use (default {LOCAL_URL})")
     parser.add_argument(
-        "--role",
-        choices=["initiator", "responder"],
-        help="initiator sends the first message; responder replies",
-    )
-    parser.add_argument(
         "--reset",
         action="store_true",
         help="discard the saved session for this room and handshake again",
@@ -109,12 +104,6 @@ def classic_details(args):
     if not password:
         sys.exit("A password is required.")
 
-    if args.role:
-        role = args.role
-    else:
-        answer = prompt("Role - [i]nitiator sends first, [r]esponder replies", "i")
-        role = "responder" if answer.lower().startswith("r") else "initiator"
-
     if args.onion:
         url, use_tor = normalise_onion(args.onion), True
     elif args.url:
@@ -124,7 +113,7 @@ def classic_details(args):
         url, use_tor = (normalise_onion(onion), True) if onion else (LOCAL_URL, False)
 
     room = args.room or prompt("Room", "spectre")
-    return {"user": user, "password": password, "role": role,
+    return {"user": user, "password": password,
             "url": url, "use_tor": use_tor, "room": room}
 
 
@@ -146,17 +135,15 @@ def screen_details(args):
 
     message = ""
     username = args.user or ""
-    role = args.role or "initiator"
 
     while True:
         credentials = screens.login_screen(
-            relay=relay_default, username=username, role=role, message=message,
+            relay=relay_default, username=username, message=message,
         )
         if credentials is None:
             return None
 
         username = credentials["user"]
-        role = credentials["role"]
         relay_default = credentials["relay"]
         url, use_tor = resolve_relay(credentials["relay"])
 
@@ -168,7 +155,7 @@ def screen_details(args):
                 message = ""
                 continue        # back to sign in
 
-        return {"user": username, "password": credentials["password"], "role": role,
+        return {"user": username, "password": credentials["password"],
                 "url": url, "use_tor": use_tor, "room": room}
 
 
@@ -200,8 +187,8 @@ def main():
 
     session = SpectreSession(
         url=details["url"], room=details["room"], user=details["user"],
-        password=details["password"], is_initiator=details["role"] == "initiator",
-        use_tor=details["use_tor"], on_event=on_event,
+        password=details["password"], use_tor=details["use_tor"],
+        on_event=on_event,
     )
 
     try:

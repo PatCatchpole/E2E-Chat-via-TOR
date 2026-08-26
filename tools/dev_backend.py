@@ -145,11 +145,16 @@ def save_message(room):
             "id": len(messages) + 1,
             "room": room,
             "sender": body.get("user"),
+            # Which member this copy is encrypted for. Without it every member
+            # is handed every copy, and the ones they cannot decrypt look like
+            # a brand new DH key -- which ratchets the session into oblivion.
+            "recipient": body.get("recipient"),
             "headerJson": json.dumps(body.get("header")),
             "bodyJson": json.dumps(body.get("body")),
         }
         messages.append(record)
     return jsonify({"id": record["id"], "sender": record["sender"],
+                    "recipient": record["recipient"],
                     "headerJson": record["headerJson"],
                     "bodyJson": record["bodyJson"]}), 201
 
@@ -157,9 +162,15 @@ def save_message(room):
 @app.get("/internal/rooms/<room>/messages")
 def list_messages(room):
     since = request.args.get("sinceId", type=int)
+    recipient = request.args.get("recipient")
     with lock:
-        out = [m for m in messages
-               if m["room"] == room and (since is None or m["id"] > since)]
+        out = [
+            m for m in messages
+            if m["room"] == room
+            and (since is None or m["id"] > since)
+            # A null recipient predates group support and goes to everyone.
+            and (recipient is None or m.get("recipient") in (None, recipient))
+        ]
     return jsonify(out)
 
 

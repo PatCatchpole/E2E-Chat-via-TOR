@@ -57,9 +57,11 @@ RELAY_PORT = int(os.environ.get("SPECTRE_RELAY_PORT", "5000"))
 # is unaffected. Set explicitly only if you build a web client.
 CORS_ORIGINS = [o for o in os.environ.get("SPECTRE_CORS_ORIGINS", "").split(",") if o]
 
-# Two peers per room. The bundle exchange and the Double Ratchet are strictly
-# pairwise; a third participant cannot be part of the same session.
-ROOM_CAPACITY = 2
+# A room is a mesh of pairwise sessions, so traffic grows with the square of
+# the member count: each message is encrypted and relayed once per recipient.
+# The cap keeps that from getting out of hand rather than being a protocol
+# limit.
+ROOM_CAPACITY = int(os.environ.get("SPECTRE_ROOM_CAPACITY", "8"))
 
 # Generous for a text message, small enough that a peer cannot exhaust the
 # database with one packet.
@@ -347,17 +349,21 @@ def handle_join(data):
         log.warning("could not persist bundle for %s: %s", user, e)
 
     log.info("%s joined room %s (%d present)", user, room, len(members))
-    emit("joined", {"room": room, "user": user})
+    emit("joined", {
+        "room": room,
+        "user": user,
+        "members": sorted(info["user"] for info in members.values()),
+    })
 
-    # Swap bundles with the peer, if one is already here. The relay does not
-    # inspect or validate bundles; the clients verify each other's signatures.
+    # Swap bundles with every member already here, so the joiner ends up with a
+    # pairwise session against each of them. The relay does not inspect or
+    # validate bundles; the clients verify each other's signatures.
     for peer_sid, peer in others.items():
         socketio.emit("bundle", {"from": user, "bundle": bundle}, room=peer_sid)
         socketio.emit("bundle", {"from": peer["user"], "bundle": peer["bundle"]},
                       room=request.sid)
         socketio.emit("peer_joined", {"user": user}, room=peer_sid)
         log.info("exchanged bundles between %s and %s", user, peer["user"])
-        break
 
     _replay_backlog(room, user, join_resp.get("lastSeenMessageId"))
 
@@ -365,7 +371,9 @@ def handle_join(data):
 def _replay_backlog(room: str, user: str, last_seen) -> None:
     """Deliver messages this user has not acknowledged yet."""
     try:
-        params = {"sinceId": last_seen} if last_seen is not None else {}
+        params = {"recipient": user}
+        if last_seen is not None:
+            params["sinceId"] = last_seen
         messages = backend_get(f"/internal/rooms/{room}/messages", params=params) or []
     except BackendError as e:
         log.warning("could not fetch backlog for %s in %s: %s", user, room, e)
@@ -374,6 +382,11 @@ def _replay_backlog(room: str, user: str, last_seen) -> None:
     delivered = 0
     for message in messages:
         if message.get("sender") == user:
+            continue
+        # Each copy is encrypted for exactly one recipient; delivering somebody
+        # else's copy would just fail to decrypt.
+        recipient = message.get("recipient")
+        if recipient is not None and recipient != user:
             continue
         try:
             header = json.loads(message["headerJson"])
@@ -389,6 +402,7 @@ def _replay_backlog(room: str, user: str, last_seen) -> None:
             "hdr": header,
             "body": body,
             "id": message["id"],
+            "to": message.get("recipient"),
         }, room=request.sid)
         delivered += 1
 
@@ -453,6 +467,21 @@ def handle_packet(data):
         emit("error_msg", {"message": "Malformed packet."})
         return
 
+    # Each packet is encrypted for one member, so it is addressed to one
+    # member. Delivering it to the whole room would leak nothing (they could
+    # not decrypt it) but would waste bandwidth and confuse the receivers.
+    recipient = data.get("to")
+    if not isinstance(recipient, str) or not recipient:
+        emit("error_msg", {"message": "Packet has no recipient."})
+        return
+
+    # A recipient who is offline is normal, not an error: their copy is
+    # persisted and delivered from the backlog when they next join. So the
+    # recipient is not validated against the connected members here -- the
+    # sender's own membership, checked above, is what matters.
+    members = rooms.get(room, {})
+    recipient_sids = [sid for sid, info in members.items() if info["user"] == recipient]
+
     size = len(json.dumps({"hdr": header, "body": body}))
     if size > MAX_PACKET_BYTES:
         emit("error_msg", {"message": f"Packet too large ({size} bytes)."})
@@ -462,7 +491,7 @@ def handle_packet(data):
         message_id = None
         try:
             saved = backend_post(f"/internal/rooms/{room}/messages", {
-                "user": user, "header": header, "body": body,
+                "user": user, "recipient": recipient, "header": header, "body": body,
             }) or {}
             message_id = saved.get("id")
         except BackendError as e:
@@ -474,14 +503,16 @@ def handle_packet(data):
             "type": "msg",
             "room": room,
             "user": user,
+            "to": recipient,
             "hdr": header,
             "body": body,
         }
         if message_id is not None:
             outgoing["id"] = message_id
 
-        emit("packet", outgoing, room=room, include_self=False)
-        log.debug("relayed message %s in %s", message_id, room)
+        for sid in recipient_sids:
+            socketio.emit("packet", outgoing, room=sid)
+        log.debug("relayed message %s in %s to %s", message_id, room, recipient)
 
 
 @socketio.on("seen")

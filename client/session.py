@@ -1,21 +1,30 @@
 """
-Protocol session: transport, handshake and message handling.
+Protocol session: transport, handshakes and message handling.
 
-Deliberately free of user-interface code -- it reports everything through an
+A room is a mesh of pairwise Double Ratchet sessions, one per peer. Nothing
+about the cryptography is group-aware: sending to a room means encrypting the
+message separately for every member and emitting one packet each. That costs
+O(n^2) traffic across the room, which is the price of every member keeping the
+same forward secrecy and post-compromise guarantees they had one-to-one.
+
+Deliberately free of user-interface code -- everything is reported through an
 `on_event` callback so the terminal UI and the tests drive the same object.
 """
 
 from __future__ import annotations
 
+import base64
 import threading
 import time
 
 import requests
 import socketio
 
+from crypto.framing import PRIME, TEXT, FramingError, frame_prime, frame_text, parse
 from crypto.keys import Bundle, Identity, b64e, safety_number
 from crypto.password import derive_verifier
 from crypto.ratchet import DoubleRatchet, RatchetError
+from crypto.roles import is_initiator
 from crypto.state import restore_ratchet, snapshot_ratchet
 from crypto.x3dh import x3dh_initiator, x3dh_responder
 import storage
@@ -30,7 +39,7 @@ class SessionError(Exception):
 
 class PeerIdentityChanged(Exception):
     """
-    The peer's long-term identity key differs from the one recorded for this
+    A peer's long-term identity key differs from the one recorded for this
     room. Either they reinstalled, or something is sitting in the middle.
     """
 
@@ -41,53 +50,63 @@ class PeerIdentityChanged(Exception):
         self.new_identity = new_identity
 
 
+class Peer:
+    """One pairwise session inside a room."""
+
+    def __init__(self, user: str, identity_b64: str, ratchet: DoubleRatchet):
+        self.user = user
+        self.identity_b64 = identity_b64
+        self.ratchet = ratchet
+        self.safety_number = None
+        self.verified = False
+        self.online = False
+        self.sent = 0
+        self.received = 0
+
+    @property
+    def can_send(self) -> bool:
+        return self.ratchet is not None and self.ratchet.can_send()
+
+
 class SpectreSession:
     """
-    One conversation: one room, one peer, one ratchet.
+    One room: many peers, one ratchet each.
 
     Events emitted through `on_event(kind, payload)`:
-        status      transport/handshake progress          {"text": str}
-        error       something the user must see            {"text": str}
-        message     decrypted inbound message              {"user", "text", "ts"}
-        sent        our own message, for echoing           {"user", "text", "ts"}
-        peer        peer joined or left                    {"user", "joined": bool}
-        ready       ratchet established                    {"safety_number", "peer"}
-        warning     security-relevant, needs attention     {"text": str}
-        state       connection/ratchet flags changed       {}
+        status      transport/handshake progress          {"text"}
+        error       something the user must see           {"text"}
+        message     decrypted inbound message             {"user", "text", "ts"}
+        sent        our own message, for echoing          {"user", "text", "ts"}
+        peer        a peer joined or left                 {"user", "joined"}
+        ready       a pairwise session was established    {"peer", "safety_number"}
+        warning     security-relevant, needs attention    {"text"}
+        state       counters or flags changed             {}
     """
 
-    def __init__(self, url, room, user, password, is_initiator, use_tor, on_event):
+    def __init__(self, url, room, user, password, use_tor, on_event, is_initiator=None):
         self.url = url
         self.room = room
         self.user = user
-        self.is_initiator = is_initiator
         self.use_tor = use_tor
         self.on_event = on_event
 
+        # Roles are derived per peer from the username ordering, so the caller
+        # no longer chooses one. Accepted and ignored for compatibility.
+        self._legacy_role = is_initiator
+
         self.connected = False
-        self.peer_user = None
-        self.peer_identity_b64 = None
-        self.safety_number = None
-        self.peer_verified = False
-        self.sent_count = 0
-        self.recv_count = 0
+        self.peers = {}                 # username -> Peer
+        self._pending = {}              # username -> [packet]
+        self._outbox = []               # text queued before anyone is reachable
+        self._identity_changes = {}     # username -> PeerIdentityChanged
 
         self._verifier = derive_verifier(user, password)
         self._identity = self._load_or_create_identity()
-        self._ratchet = None
-        self._pending = []
-        # Highest backend message id already decrypted. The relay replays
-        # anything past a peer's last acknowledged id on join, and an
-        # acknowledgement can be lost, so the client must not depend on the
-        # relay to avoid re-delivering a message it has already processed.
-        self._last_message_id = 0
+        self._joined = False
         self._lock = threading.RLock()
 
-        # `join` is a round trip. Anything typed before the relay confirms it
-        # would be rejected as "not a participant" and lost, so outbound text
-        # waits here and is encrypted in order once the room is live.
-        self._joined = False
-        self._outbox = []
+        progress = storage.load_progress(user, room)
+        self._last_message_id = progress.get("last_message_id", 0)
 
         self._login_event = threading.Event()
         self._login_result = {}
@@ -96,7 +115,7 @@ class SpectreSession:
 
         self.sio = self._build_client()
         self._wire_handlers()
-        self._restore_ratchet()
+        self._restore_sessions()
 
     # ---- setup --------------------------------------------------------
 
@@ -126,26 +145,32 @@ class SpectreSession:
             http_session=http_session, reconnection=True, reconnection_attempts=0
         )
 
-    def _restore_ratchet(self):
-        saved = storage.load_state(self.user, self.room)
-        if saved is None:
-            return
-        try:
-            self._ratchet = restore_ratchet(saved["ratchet"])
-            self._last_message_id = saved.get("last_message_id", 0)
-        except (KeyError, TypeError, ValueError) as e:
-            self._emit("warning",
-                       text=f"Could not restore the saved session ({e}). "
-                            f"Starting a fresh handshake.")
-            storage.clear_state(self.user, self.room)
-            return
+    def _restore_sessions(self):
+        """Reload every pairwise session saved for this room."""
+        restored = 0
+        for peer_user in storage.list_peers(self.user, self.room):
+            known = storage.load_known_peer(self.user, self.room, peer_user)
+            saved = storage.load_state(self.user, self.room, peer_user)
+            if not known or not saved:
+                continue
+            try:
+                ratchet = restore_ratchet(saved["ratchet"])
+            except (KeyError, TypeError, ValueError) as e:
+                self._emit("warning",
+                           text=f"Could not restore the session with {peer_user} "
+                                f"({e}). It will be renegotiated.")
+                storage.clear_state(self.user, self.room, peer_user)
+                continue
 
-        known = storage.load_known_peer(self.user, self.room)
-        if known:
-            self.peer_user = known.get("user")
-            self.peer_identity_b64 = known.get("identity")
-            self._recompute_safety_number()
-        self._emit("status", text="Resumed the saved session for this room.")
+            peer = Peer(peer_user, known.get("identity"), ratchet)
+            peer.safety_number = self._safety_number(known.get("identity"))
+            self.peers[peer_user] = peer
+            restored += 1
+
+        if restored:
+            self._emit("status",
+                       text=f"Resumed {restored} saved "
+                            f"session{'s' if restored != 1 else ''} in this room.")
 
     def _emit(self, kind, **payload):
         try:
@@ -153,13 +178,12 @@ class SpectreSession:
         except Exception:
             pass  # the UI must never take the session down
 
-    def _recompute_safety_number(self):
-        if not self.peer_identity_b64:
-            return
-        import base64
-        self.safety_number = safety_number(
+    def _safety_number(self, peer_identity_b64):
+        if not peer_identity_b64:
+            return None
+        return safety_number(
             self._identity.identity_public_bytes(),
-            base64.b64decode(self.peer_identity_b64),
+            base64.b64decode(peer_identity_b64),
         )
 
     # ---- socket handlers ----------------------------------------------
@@ -198,29 +222,39 @@ class SpectreSession:
         def on_joined(data):
             self._joined = True
             self._emit("status", text=f"Joined #{(data or {}).get('room')}.")
+            for name in (data or {}).get("members", []):
+                if name != self.user and name in self.peers:
+                    self.peers[name].online = True
             self._flush_outbox()
+            self._emit("state")
 
         @sio.on("peer_joined")
         def on_peer_joined(data):
-            self._emit("peer", user=(data or {}).get("user"), joined=True)
+            name = (data or {}).get("user")
+            if name and name in self.peers:
+                self.peers[name].online = True
+            self._emit("peer", user=name, joined=True)
 
         @sio.on("peer_left")
         def on_peer_left(data):
-            self._emit("peer", user=(data or {}).get("user"), joined=False)
+            name = (data or {}).get("user")
+            if name and name in self.peers:
+                self.peers[name].online = False
+            self._emit("peer", user=name, joined=False)
 
         @sio.on("bundle")
         def on_bundle(data):
             try:
                 self._handle_bundle((data or {}).get("bundle") or {})
             except PeerIdentityChanged as e:
+                self._identity_changes[e.peer_user] = e
                 self._emit("warning",
                            text=f"WARNING: the identity key for '{e.peer_user}' has "
                                 f"changed since you last spoke. If they did not "
                                 f"reinstall, someone may be intercepting this "
-                                f"conversation. Run /trust to accept the new key.")
-                self._pending_identity_change = e
+                                f"conversation. Run /trust {e.peer_user} to accept it.")
             except Exception as e:
-                self._emit("error", text=f"Rejected the peer's key bundle: {e}")
+                self._emit("error", text=f"Rejected a key bundle: {e}")
 
         @sio.on("packet")
         def on_packet(data):
@@ -231,9 +265,9 @@ class SpectreSession:
     def _handle_bundle(self, raw_bundle: dict):
         with self._lock:
             # Validation runs before the "already established" check on
-            # purpose. Returning early here would skip the identity comparison
-            # for exactly the case that matters most: a peer whose long-term
-            # key changes partway through a relationship.
+            # purpose. Returning early would skip the identity comparison for
+            # exactly the case that matters most: a peer whose long-term key
+            # changes partway through a relationship.
             try:
                 bundle = Bundle.from_dict(raw_bundle)
             except (KeyError, ValueError, TypeError) as e:
@@ -252,90 +286,115 @@ class SpectreSession:
                 raise SessionError("received our own bundle back from the relay")
 
             identity_b64 = b64e(bundle.identity)
-            known = storage.load_known_peer(self.user, self.room)
+            known = storage.load_known_peer(self.user, self.room, bundle.user)
             if known and known.get("identity") != identity_b64:
                 raise PeerIdentityChanged(
                     bundle.user, known.get("identity"), identity_b64
                 )
 
-            if self._ratchet is not None:
+            existing = self.peers.get(bundle.user)
+            if existing is not None and existing.ratchet is not None:
                 # Same peer, same identity, session already up. Renegotiating
-                # would discard the ratchet and reuse message keys, so the
-                # bundle is acknowledged and otherwise ignored.
+                # would discard the ratchet and reuse message keys.
+                existing.online = True
                 return
 
-            self.peer_user = bundle.user
-            self.peer_identity_b64 = identity_b64
-
-            if self.is_initiator:
+            initiator = is_initiator(self.user, bundle.user)
+            if initiator:
                 shared = x3dh_initiator(self._identity, bundle)
-                self._ratchet = DoubleRatchet.initiator(shared, bundle.signed_prekey)
+                ratchet = DoubleRatchet.initiator(shared, bundle.signed_prekey)
             else:
                 shared = x3dh_responder(self._identity, bundle)
-                self._ratchet = DoubleRatchet.responder(
+                ratchet = DoubleRatchet.responder(
                     shared, self._identity.signed_prekey_private
                 )
 
+            peer = Peer(bundle.user, identity_b64, ratchet)
+            peer.safety_number = self._safety_number(identity_b64)
+            peer.online = True
+            self.peers[bundle.user] = peer
+
             storage.save_known_peer(self.user, self.room, bundle.user, identity_b64)
-            self._recompute_safety_number()
-            self._save_state()
+            self._save_state(bundle.user)
 
-            self._emit("ready", safety_number=self.safety_number, peer=bundle.user)
-            self._flush_outbox()
-            if not self._ratchet.can_send():
-                self._emit("status",
-                           text=f"Waiting for {bundle.user} to send the first "
-                                f"message before this side can reply.")
-            self._drain_pending()
+        self._emit("ready", peer=bundle.user, safety_number=peer.safety_number)
 
-    def _drain_pending(self):
-        queued, self._pending = self._pending, []
+        # The initiator opens the reverse direction immediately. Without this
+        # the peer has no sending chain and cannot reply until we send real
+        # text -- which in a group would leave the last member mute.
+        if initiator:
+            self._send_to(bundle.user, frame_prime())
+
+        self._drain_pending(bundle.user)
+        self._flush_outbox()
+        self._emit("state")
+
+    def _drain_pending(self, peer_user: str):
+        queued = self._pending.pop(peer_user, [])
         for packet in queued:
             self._handle_packet(packet, queued=True)
 
-    # ---- messaging ----------------------------------------------------
+    # ---- receiving ----------------------------------------------------
 
     def _handle_packet(self, data: dict, queued: bool = False):
         if data.get("type") != "msg":
             return
-        if data.get("user") == self.user:
+
+        sender = data.get("user")
+        if not sender or sender == self.user:
             return
 
         message_id = data.get("id")
         if isinstance(message_id, int) and message_id <= self._last_message_id:
-            # Already decrypted in an earlier run; re-feeding it to the ratchet
+            # Already processed in an earlier run; re-feeding it to the ratchet
             # would be rejected as a stale replay and log a spurious error.
             self._ack(message_id)
             return
 
         with self._lock:
-            if self._ratchet is None:
+            peer = self.peers.get(sender)
+            if peer is None or peer.ratchet is None:
                 if not queued:
-                    self._pending.append(data)
+                    self._pending.setdefault(sender, []).append(data)
                 return
 
             try:
-                plaintext = self._ratchet.decrypt(data)
+                payload = peer.ratchet.decrypt(data)
             except RatchetError as e:
-                self._emit("error", text=f"Could not decrypt a message: {e}")
+                self._emit("error",
+                           text=f"Could not decrypt a message from {sender}: {e}")
                 return
             except Exception as e:
-                self._emit("error", text=f"Unexpected error decrypting: {e}")
+                self._emit("error",
+                           text=f"Unexpected error decrypting from {sender}: {e}")
                 return
 
-            self.recv_count += 1
+            try:
+                kind, text = parse(payload)
+            except FramingError as e:
+                self._emit("error", text=f"Unreadable message from {sender}: {e}")
+                return
+
             if isinstance(message_id, int):
                 self._last_message_id = max(self._last_message_id, message_id)
-            self._save_state()
+                self._save_progress()
+            self._save_state(sender)
 
-        text = plaintext.decode("utf-8", errors="replace")
-        self._emit("message", user=data.get("user") or self.peer_user or "peer",
-                   text=text, ts=time.time())
-        self._emit("state")
-        self._flush_outbox()
+            if kind == TEXT:
+                peer.received += 1
 
         if isinstance(message_id, int):
             self._ack(message_id)
+
+        if kind == PRIME:
+            # Silent: its only purpose was to give us a sending chain.
+            self._flush_outbox()
+            self._emit("state")
+            return
+
+        self._emit("message", user=sender, text=text, ts=time.time())
+        self._emit("state")
+        self._flush_outbox()
 
     def _ack(self, message_id: int) -> None:
         try:
@@ -343,72 +402,89 @@ class SpectreSession:
         except Exception:
             pass  # best effort; the client-side id check is the real guard
 
+    # ---- sending ------------------------------------------------------
+
     def send_message(self, text: str) -> bool:
+        """
+        Encrypt `text` once per peer and send each copy.
+
+        Returns True if it reached at least one peer, or was queued for later.
+        """
         with self._lock:
-            if not self._joined or self._ratchet is None or not self._ratchet.can_send():
-                # Not ready to encrypt yet. Hold the plaintext and send it in
-                # order once the handshake and the join have both completed.
-                if self._ratchet is None or not self._ratchet.can_send():
-                    if self._ratchet is not None and not self._ratchet.can_send():
-                        self._emit("status",
-                                   text="Queued -- waiting for the peer's first message.")
-                    else:
-                        self._emit("status", text="Queued -- session not ready yet.")
+            reachable = [p for p in self.peers.values() if p.can_send]
+            if not self._joined or not reachable:
                 self._outbox.append(text)
+                if not self.peers:
+                    self._emit("status", text="Queued -- waiting for someone to join.")
+                else:
+                    self._emit("status", text="Queued -- no peer is reachable yet.")
                 return True
+            targets = [p.user for p in reachable]
 
-        return self._encrypt_and_send(text)
+        delivered = 0
+        for peer_user in targets:
+            if self._send_to(peer_user, frame_text(text)):
+                delivered += 1
 
-    def _flush_outbox(self):
+        if delivered:
+            self._emit("sent", user=self.user, text=text, ts=time.time())
+            self._emit("state")
+        return delivered > 0
+
+    def _send_to(self, peer_user: str, payload: bytes) -> bool:
+        """Encrypt one already-framed payload for one peer and emit it."""
         with self._lock:
-            if self._ratchet is None or not self._ratchet.can_send() or not self._joined:
-                return
-            pending, self._outbox = self._outbox, []
-        for text in pending:
-            self._encrypt_and_send(text)
-
-    def _encrypt_and_send(self, text: str) -> bool:
-        with self._lock:
-            if self._ratchet is None:
-                self._emit("error", text="No secure session yet -- waiting for the peer.")
+            peer = self.peers.get(peer_user)
+            if peer is None or not peer.can_send:
                 return False
-            if not self._ratchet.can_send():
-                self._emit("error",
-                           text="Cannot send yet: this side is the responder and must "
-                                "receive one message first.")
-                return False
-
             try:
-                packet = self._ratchet.encrypt(text.encode("utf-8"))
+                packet = peer.ratchet.encrypt(payload)
             except RatchetError as e:
-                self._emit("error", text=f"Encryption failed: {e}")
+                self._emit("error", text=f"Encryption failed for {peer_user}: {e}")
                 return False
-
-            self.sent_count += 1
-            self._save_state()
+            if payload and payload[0] == TEXT:
+                peer.sent += 1
+            self._save_state(peer_user)
 
         packet["type"] = "msg"
         packet["room"] = self.room
+        packet["to"] = peer_user
         try:
             self.sio.emit("packet", packet)
         except Exception as e:
             self._emit("error", text=f"Could not reach the relay: {e}")
             return False
-
-        self._emit("sent", user=self.user, text=text, ts=time.time())
-        self._emit("state")
         return True
 
-    def _save_state(self):
-        if self._ratchet is None:
+    def _flush_outbox(self):
+        with self._lock:
+            if not self._joined or not self._outbox:
+                return
+            if not any(p.can_send for p in self.peers.values()):
+                return
+            pending, self._outbox = self._outbox, []
+        for text in pending:
+            self.send_message(text)
+
+    # ---- persistence --------------------------------------------------
+
+    def _save_state(self, peer_user: str):
+        peer = self.peers.get(peer_user)
+        if peer is None or peer.ratchet is None:
             return
         try:
-            storage.save_state(self.user, self.room, {
-                "ratchet": snapshot_ratchet(self._ratchet),
-                "last_message_id": self._last_message_id,
+            storage.save_state(self.user, self.room, peer_user, {
+                "ratchet": snapshot_ratchet(peer.ratchet),
             })
         except OSError as e:
             self._emit("error", text=f"Could not persist session state: {e}")
+
+    def _save_progress(self):
+        try:
+            storage.save_progress(self.user, self.room,
+                                  {"last_message_id": self._last_message_id})
+        except OSError:
+            pass
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -438,22 +514,14 @@ class SpectreSession:
 
     def _login(self):
         self._login_event.clear()
-        self.sio.emit("login", {
-            "user": self.user,
-            "verifier": self._verifier,
-            "role": "initiator" if self.is_initiator else "responder",
-        })
+        self.sio.emit("login", {"user": self.user, "verifier": self._verifier})
         if not self._login_event.wait(timeout=REQUEST_TIMEOUT):
             raise SessionError("the relay did not answer the login request")
         return self._login_result
 
     def _register(self):
         self._register_event.clear()
-        self.sio.emit("register", {
-            "user": self.user,
-            "verifier": self._verifier,
-            "role": "initiator" if self.is_initiator else "responder",
-        })
+        self.sio.emit("register", {"user": self.user, "verifier": self._verifier})
         if not self._register_event.wait(timeout=REQUEST_TIMEOUT):
             raise SessionError("the relay did not answer the registration request")
         return self._register_result
@@ -472,10 +540,11 @@ class SpectreSession:
             self.sio.emit("leave", {"room": self.room})
         except Exception:
             pass
-        try:
-            self._save_state()
-        except Exception:
-            pass
+        for peer_user in list(self.peers):
+            try:
+                self._save_state(peer_user)
+            except Exception:
+                pass
         try:
             self.sio.disconnect()
         except Exception:
@@ -483,28 +552,54 @@ class SpectreSession:
 
     # ---- user actions -------------------------------------------------
 
-    def mark_verified(self):
-        self.peer_verified = True
-        self._emit("state")
-
-    def trust_new_identity(self):
-        """Accept a changed peer identity after the user has re-verified."""
-        pending = getattr(self, "_pending_identity_change", None)
-        if pending is None:
+    def mark_verified(self, peer_user: str) -> bool:
+        peer = self.peers.get(peer_user)
+        if peer is None:
             return False
-        storage.save_known_peer(self.user, self.room, pending.peer_user,
-                                pending.new_identity)
-        storage.clear_state(self.user, self.room)
-        self._pending_identity_change = None
-        self.peer_verified = False
-        self._emit("status",
-                   text="New identity accepted. Restart the client to handshake again.")
+        peer.verified = True
+        self._emit("state")
         return True
 
-    @property
-    def ready(self):
-        return self._ratchet is not None
+    def trust_new_identity(self, peer_user: str) -> bool:
+        """Accept a changed peer identity after the user has re-verified."""
+        pending = self._identity_changes.pop(peer_user, None)
+        if pending is None:
+            return False
+        storage.clear_state(self.user, self.room, peer_user)
+        storage.save_known_peer(self.user, self.room, peer_user, pending.new_identity)
+        self.peers.pop(peer_user, None)
+        self._emit("status",
+                   text=f"New identity for {peer_user} accepted. "
+                        f"Restart the client to handshake again.")
+        self._emit("state")
+        return True
+
+    # ---- views --------------------------------------------------------
 
     @property
-    def can_send(self):
-        return self._ratchet is not None and self._ratchet.can_send()
+    def ready(self) -> bool:
+        return any(p.ratchet is not None for p in self.peers.values())
+
+    @property
+    def can_send(self) -> bool:
+        return any(p.can_send for p in self.peers.values())
+
+    @property
+    def member_names(self) -> list:
+        return sorted(self.peers)
+
+    @property
+    def sent_count(self) -> int:
+        return sum(p.sent for p in self.peers.values())
+
+    @property
+    def recv_count(self) -> int:
+        return sum(p.received for p in self.peers.values())
+
+    @property
+    def pending_identity_changes(self) -> list:
+        return sorted(self._identity_changes)
+
+    def safety_number_for(self, peer_user: str):
+        peer = self.peers.get(peer_user)
+        return peer.safety_number if peer else None

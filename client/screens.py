@@ -120,11 +120,14 @@ def _base_bindings(on_cancel):
 
 
 def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
-                 role: str = "initiator", message: str = ""):
+                 message: str = ""):
     """
     Collect connection details.
 
-    Returns {"relay", "user", "password", "role"} or None if cancelled.
+    Returns {"relay", "user", "password"} or None if cancelled. There is no
+    role to pick: who initiates a pairwise session is derived from the
+    usernames, which is the only rule that works once a room has more than two
+    people in it.
     Credentials are not checked here -- that happens when the session connects,
     so a failure comes back as `message` on the next pass.
     """
@@ -133,13 +136,6 @@ def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
     relay_field = TextArea(text=relay, multiline=False, wrap_lines=False, height=1)
     user_field = TextArea(text=username, multiline=False, wrap_lines=False, height=1)
     pass_field = TextArea(password=True, multiline=False, wrap_lines=False, height=1)
-    role_list = SubmitOnEnterList(
-        values=[("initiator", "Initiator  - starts the conversation"),
-                ("responder", "Responder  - replies to the initiator")],
-        on_submit=lambda: submit(),
-        default=role,
-    )
-
     def submit():
         if not relay_field.text.strip():
             error["text"] = "A relay address is required."
@@ -152,7 +148,6 @@ def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
                 "relay": relay_field.text.strip(),
                 "user": user_field.text.strip(),
                 "password": pass_field.text,
-                "role": role_list.current_value,
             })
             return
         app.invalidate()
@@ -177,8 +172,6 @@ def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
                 _labelled("Username", user_field),
                 Window(height=1),
                 _labelled("Password", pass_field),
-                Window(height=1),
-                _labelled("Role", role_list),
             ]), padding_left=1, padding_right=1, padding_top=1, padding_bottom=1),
             title="Sign in",
         ),

@@ -151,6 +151,39 @@ class DoubleRatchet:
     # ---- receiving ----------------------------------------------------
 
     def decrypt(self, packet: dict) -> bytes:
+        """
+        Decrypt one packet, or leave the ratchet exactly as it was.
+
+        The DH ratchet step and the skipped-key derivation both run before the
+        AEAD tag can be checked, so a packet that fails to authenticate would
+        otherwise leave the chains advanced against a key the peer never used.
+        One forged packet carrying a random DH public key would be enough to
+        destroy a session permanently -- and the damage would be persisted.
+        So the mutable state is captured first and rolled back on any failure.
+        """
+        snapshot = self._capture_state()
+        try:
+            return self._decrypt(packet)
+        except Exception:
+            self._restore_state(snapshot)
+            raise
+
+    def _capture_state(self) -> tuple:
+        # Byte strings and PrivateKey are immutable; the containers are copied.
+        return (
+            self.root_key, self.dh_pair, self.peer_dh_public,
+            self.sending_chain, self.receiving_chain,
+            self.send_count, self.recv_count, self.previous_chain_length,
+            dict(self.skipped), set(self.retired_dh),
+        )
+
+    def _restore_state(self, snapshot: tuple) -> None:
+        (self.root_key, self.dh_pair, self.peer_dh_public,
+         self.sending_chain, self.receiving_chain,
+         self.send_count, self.recv_count, self.previous_chain_length,
+         self.skipped, self.retired_dh) = snapshot
+
+    def _decrypt(self, packet: dict) -> bytes:
         header, nonce, ciphertext = self._parse(packet)
         peer_dh = base64.b64decode(header["dh"])
         n = header["n"]

@@ -111,43 +111,55 @@ def save_identity_seed(user: str, seed: bytes) -> None:
 # ---- ratchet state ----------------------------------------------------
 
 
-def state_path(user: str, room: str) -> Path:
-    return STATE_DIR / f"{_safe_name(user)}__{_safe_name(room)}.json"
+def state_path(user: str, room: str, peer: str) -> Path:
+    # One ratchet per (room, peer): a group is a mesh of pairwise sessions, so
+    # state cannot be keyed by room alone.
+    return STATE_DIR / f"{_safe_name(user)}__{_safe_name(room)}__{_safe_name(peer)}.json"
 
 
-def load_state(user: str, room: str):
-    return _read_json(state_path(user, room))
+def load_state(user: str, room: str, peer: str):
+    return _read_json(state_path(user, room, peer))
 
 
-def save_state(user: str, room: str, snapshot: dict) -> None:
-    # The room and user are recorded inside the file as well as in its name,
-    # because _safe_name is lossy -- the original name cannot be recovered from
-    # the filename, and the room list needs it.
+def save_state(user: str, room: str, peer: str, snapshot: dict) -> None:
+    # Room, user and peer are recorded inside the file as well as in its name,
+    # because _safe_name is lossy -- the originals cannot be recovered from the
+    # filename, and the room list needs them.
     payload = dict(snapshot)
     payload.setdefault("room", room)
     payload.setdefault("user", user)
-    _write_private(state_path(user, room), json.dumps(payload).encode("utf-8"))
+    payload.setdefault("peer", peer)
+    _write_private(state_path(user, room, peer), json.dumps(payload).encode("utf-8"))
 
 
-def clear_state(user: str, room: str) -> None:
-    state_path(user, room).unlink(missing_ok=True)
+def clear_state(user: str, room: str, peer: str = None) -> None:
+    """Drop one peer's session, or every session in the room when peer is None."""
+    if peer is not None:
+        state_path(user, room, peer).unlink(missing_ok=True)
+        peer_path(user, room, peer).unlink(missing_ok=True)
+        return
+
+    prefix = f"{_safe_name(user)}__{_safe_name(room)}__"
+    for directory in (STATE_DIR, PEERS_DIR):
+        for path in directory.glob(f"{prefix}*.json"):
+            path.unlink(missing_ok=True)
 
 
 # ---- known peer identities (trust on first use) ------------------------
 
 
-def peer_path(user: str, room: str) -> Path:
-    return PEERS_DIR / f"{_safe_name(user)}__{_safe_name(room)}.json"
+def peer_path(user: str, room: str, peer: str) -> Path:
+    return PEERS_DIR / f"{_safe_name(user)}__{_safe_name(room)}__{_safe_name(peer)}.json"
 
 
-def load_known_peer(user: str, room: str):
-    """The peer identity recorded for this room, or None on first contact."""
-    return _read_json(peer_path(user, room))
+def load_known_peer(user: str, room: str, peer: str):
+    """The identity recorded for this peer in this room, or None on first contact."""
+    return _read_json(peer_path(user, room, peer))
 
 
 def save_known_peer(user: str, room: str, peer_user: str, identity_b64: str) -> None:
     _write_private(
-        peer_path(user, room),
+        peer_path(user, room, peer_user),
         json.dumps({
             "user": peer_user,
             "identity": identity_b64,
@@ -157,12 +169,41 @@ def save_known_peer(user: str, room: str, peer_user: str, identity_b64: str) -> 
     )
 
 
+def progress_path(user: str, room: str) -> Path:
+    return STATE_DIR / f"{_safe_name(user)}__{_safe_name(room)}.progress.json"
+
+
+def load_progress(user: str, room: str) -> dict:
+    """Backend delivery progress for a room, shared across all its peers."""
+    return _read_json(progress_path(user, room)) or {}
+
+
+def save_progress(user: str, room: str, progress: dict) -> None:
+    payload = dict(progress)
+    payload.setdefault("room", room)
+    payload.setdefault("user", user)
+    _write_private(progress_path(user, room), json.dumps(payload).encode("utf-8"))
+
+
+def list_peers(user: str, room: str) -> list:
+    """Peers this user has an established session with in this room."""
+    prefix = f"{_safe_name(user)}__{_safe_name(room)}__"
+    peers = []
+    for path in PEERS_DIR.glob(f"{prefix}*.json"):
+        data = _read_json(path)
+        if isinstance(data, dict) and data.get("user"):
+            peers.append(data["user"])
+    return sorted(set(peers))
+
+
 def list_rooms(user: str) -> list:
     """
     Rooms this user has an established session for, newest first.
 
     Derived from local state, so it needs no backend support and reveals
-    nothing to the relay. Returns dicts of {room, peer, last_used}.
+    nothing to the relay. Returns dicts of {room, peers, peer, last_used},
+    where `peers` is every peer seen in that room and `peer` is set only when
+    there is exactly one.
     """
     ensure_dirs()
     prefix = _safe_name(user) + "__"
@@ -182,12 +223,20 @@ def list_rooms(user: str) -> list:
             if not room:
                 continue
 
-            entry = found.setdefault(room, {"room": room, "peer": None, "last_used": 0.0})
+            entry = found.setdefault(
+                room, {"room": room, "peers": set(), "last_used": 0.0}
+            )
             if data.get("user") and directory is PEERS_DIR:
-                entry["peer"] = data["user"]
+                entry["peers"].add(data["user"])
             try:
                 entry["last_used"] = max(entry["last_used"], path.stat().st_mtime)
             except OSError:
                 pass
 
-    return sorted(found.values(), key=lambda e: e["last_used"], reverse=True)
+    rooms = []
+    for entry in found.values():
+        entry["peers"] = sorted(entry["peers"])
+        # Kept for callers that only care about the two-party case.
+        entry["peer"] = entry["peers"][0] if len(entry["peers"]) == 1 else None
+        rooms.append(entry)
+    return sorted(rooms, key=lambda e: e["last_used"], reverse=True)

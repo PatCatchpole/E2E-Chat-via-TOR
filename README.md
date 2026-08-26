@@ -1,8 +1,14 @@
 # SpectreProtocol — End-to-end encrypted chat over Tor
 
-Two-party text chat using X3DH for key agreement and the Double Ratchet for
-forward secrecy and post-compromise security, relayed over Socket.IO and
-optionally exposed as a Tor hidden service.
+Group text chat using X3DH for key agreement and the Double Ratchet for forward
+secrecy and post-compromise security, relayed over Socket.IO and optionally
+exposed as a Tor hidden service.
+
+A room is a **mesh of pairwise sessions**: every member holds a separate ratchet
+with every other member, and each message is encrypted once per recipient. Every
+member therefore keeps exactly the guarantees they would have one-to-one. The
+cost is that traffic grows with the square of the room size, which is why
+`SPECTRE_ROOM_CAPACITY` defaults to 8.
 
 > **Status: a learning project, not a vetted messenger.** The cryptography is
 > hand-rolled against the published specifications rather than delegated to a
@@ -80,6 +86,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | `SPECTRE_BACKEND_URL` | relay | Defaults to `http://127.0.0.1:8090`. |
 | `SPECTRE_RELAY_HOST`, `SPECTRE_RELAY_PORT` | relay | Default `127.0.0.1:5000`. |
 | `SPECTRE_CORS_ORIGINS` | relay | Comma-separated browser origins. Empty by default; the CLI does not need it. |
+| `SPECTRE_ROOM_CAPACITY` | relay | Maximum members per room. Defaults to 8. |
 | `SPECTRE_ALLOW_DEV_SERVER` | relay | Set to `1` to run the Werkzeug dev server non-interactively (systemd, docker). |
 | `SPECTRE_LOG_LEVEL` | relay | Defaults to `INFO`. |
 
@@ -125,9 +132,10 @@ python client_cli.py --room spectre --user alice --role initiator
 python client_cli.py --room spectre --user bob   --role responder
 ```
 
-The initiator sends the first message; the responder cannot send until it has
-received one, because its sending chain does not exist until then. Run without
-flags to be prompted instead.
+There is no role to choose. Who initiates a given pairwise session is derived
+from the two usernames (the lower one initiates), which is the only rule that
+still works once a room holds more than two people. Run without flags to use the
+sign-in screen and room picker.
 
 ### Windows
 
@@ -179,8 +187,9 @@ and nothing more.
 
 | Command | Effect |
 |---|---|
-| `/verify` | Print the full 60-digit safety number and mark the peer verified. |
-| `/trust` | Accept a changed peer identity key, after re-verifying out of band. |
+| `/who` | List everyone in the room, with verification and channel status. |
+| `/verify [name]` | Print a peer's 60-digit safety number and mark them verified. |
+| `/trust <name>` | Accept a changed identity key, after re-verifying out of band. |
 | `/clear` | Clear the transcript. |
 | `/help` | Command list. |
 | `/quit` | Leave the room and exit. |
@@ -190,9 +199,12 @@ and nothing more.
 ### Verifying a peer
 
 Signature checks stop the relay forging a bundle, but they cannot tell you the
-identity key you received is the one you expect. Run `/verify` on both sides and
-compare the digits over a channel the relay does not control. Until you do, the
-status bar reads `unverified`.
+identity key you received is the one you expect. Run `/verify <name>` and compare
+the digits over a channel the relay does not control. **There is one safety
+number per pair**, so in a group of four each member has three to check. The
+status bar shows how many are done.
+
+With a single peer the name can be omitted: `/verify` on its own is unambiguous.
 
 If a peer's identity key ever changes, the client refuses the new one and warns.
 That is either a reinstall or an interception attempt; confirm which out of band
@@ -235,6 +247,8 @@ Hostname resolution goes through `socks5h`, so `.onion` lookups stay inside Tor.
   its own session and requires room membership.
 - Past messages after a key compromise, and future messages after the ratchet
   recovers, given continued two-way traffic.
+- A forged or corrupted packet damaging a session. Decryption is atomic: a
+  packet that fails to authenticate leaves the ratchet exactly as it was.
 
 **Not protected against**
 
@@ -245,7 +259,11 @@ Hostname resolution goes through `socks5h`, so `.onion` lookups stay inside Tor.
 - **A compromised endpoint.** Ratchet state on disk is 0600 but not encrypted at
   rest; anyone who can read your files can read your session.
 - **Traffic analysis.** No padding, no cover traffic; message sizes and timing
-  are visible.
+  are visible. In a group the relay also sees the fan-out pattern, so it learns
+  the membership and how many copies each message produced.
+- **A member who leaves.** Removing somebody from a room does not re-key the
+  others; they keep whatever they already received. There is no group key to
+  rotate, because there is no group key.
 
 ---
 
@@ -259,7 +277,9 @@ python -m pytest tests/ -q
 The suite covers the protocol properties directly: out-of-order and dropped
 messages, both peers ratcheting simultaneously, save/restore across a restart,
 replay and stale-chain rejection, forged header counters, tampered headers and
-ciphertext, bundle signature forgery, and safety number stability.
+ciphertext, rollback after a failed authentication, bundle signature forgery,
+per-peer identity changes, role derivation, payload framing, and safety number
+stability.
 
 ---
 
@@ -274,6 +294,7 @@ ciphertext, bundle signature forgery, and safety number stability.
 | `AttributeError: can't set attribute` in the relay | Flask-SocketIO older than 5.4 against Flask ≥ 3.1. Reinstall from `requirements.txt`. |
 | `Could not restore the saved session` | State file from an older format; it is discarded and a fresh handshake runs. |
 | Peer identity change warning | Reinstall or interception. Verify out of band, then `/trust`. |
-| Responder cannot send | Expected until it receives the first message. |
+| A member cannot send yet | Their channel opens when the initiating side's priming message arrives; it is normally instant. |
+| Room says it is full | `SPECTRE_ROOM_CAPACITY` reached, or a stale client still holds a slot. |
 
 To start a room over, delete the saved state: `python client_cli.py --reset`.

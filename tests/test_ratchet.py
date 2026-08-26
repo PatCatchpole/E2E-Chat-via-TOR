@@ -229,3 +229,43 @@ def test_stale_chain_message_does_not_reset_the_ratchet():
     # The session must be unharmed by the rejected replay.
     assert recv(b, send(a, "still working")) == "still working"
     assert recv(a, send(b, "both ways")) == "both ways"
+
+
+def test_a_packet_that_fails_to_authenticate_leaves_the_ratchet_untouched():
+    """
+    Decryption must be atomic. The DH ratchet and the skipped-key derivation
+    run *before* the AEAD tag is checked, so without an explicit rollback a
+    single forged packet -- one random DH key is enough -- permanently destroys
+    the session, and the damage is persisted to disk.
+    """
+    import base64
+    import os as _os
+
+    a, b = make_session()
+    recv(b, send(a, "one"))
+    recv(a, send(b, "reply"))
+
+    forged = send(a, "never arrives")
+    forged["hdr"]["dh"] = base64.b64encode(_os.urandom(32)).decode()
+
+    with pytest.raises(RatchetError):
+        b.decrypt(forged)
+
+    assert recv(b, send(a, "still fine")) == "still fine"
+    assert recv(a, send(b, "both ways")) == "both ways"
+
+
+def test_repeated_forged_packets_do_not_degrade_the_session():
+    import base64
+    import os as _os
+
+    a, b = make_session()
+    recv(b, send(a, "open"))
+
+    for _ in range(20):
+        forged = send(a, "junk")
+        forged["hdr"]["dh"] = base64.b64encode(_os.urandom(32)).decode()
+        with pytest.raises(RatchetError):
+            b.decrypt(forged)
+
+    assert recv(b, send(a, "unharmed")) == "unharmed"

@@ -39,6 +39,10 @@ STYLE = Style.from_dict({
     "time": "#5c6773",
     "self": "#5fd75f bold",
     "peer": "#7fd1e0 bold",
+    "peer2": "#c792ea bold",
+    "peer3": "#ffb454 bold",
+    "peer4": "#f78c6c bold",
+    "peer5": "#89ddff bold",
     "text": "",
     "system": "#6b7b8c italic",
     "error": "#ff6b6b",
@@ -47,11 +51,12 @@ STYLE = Style.from_dict({
 })
 
 HELP_LINES = [
-    "/verify   show the full safety number and mark this peer verified",
-    "/trust    accept a changed peer identity key (only after re-verifying)",
-    "/clear    clear the transcript",
-    "/help     this list",
-    "/quit     leave the room and exit",
+    "/who              list everyone in the room and their status",
+    "/verify [name]    show a safety number and mark that peer verified",
+    "/trust <name>     accept a changed identity key (after re-verifying)",
+    "/clear            clear the transcript",
+    "/help             this list",
+    "/quit             leave the room and exit",
 ]
 
 
@@ -109,14 +114,21 @@ class ChatUI:
         else:
             state = ("class:header.bad", " offline ")
 
-        peer = self.session.peer_user or "waiting for peer"
+        members = self.session.member_names
+        if not members:
+            who = "waiting for others"
+        elif len(members) <= 3:
+            who = ", ".join(members)
+        else:
+            who = f"{len(members)} others"
+
         fragments = [
             ("class:header", " SPECTRE "),
             ("class:header.room", f"#{self.room} "),
             ("class:header.dim", " "),
             ("class:header.room", self.user),
-            ("class:header.dim", " <-> "),
-            ("class:header.room", peer),
+            ("class:header.dim", " with "),
+            ("class:header.room", who),
             ("class:header.dim", "  "),
             state,
         ]
@@ -130,23 +142,34 @@ class ChatUI:
             return [("class:status", " handshake pending"),
                     ("class:status", " " * 200)]
 
-        if self.session.peer_verified:
-            mark = ("class:status.verified", " verified ")
-        else:
-            mark = ("class:status.unverified", " unverified ")
+        peers = self.session.peers
+        verified = sum(1 for p in peers.values() if p.verified)
+        total = len(peers)
 
-        number = self.session.safety_number or ""
-        short = " ".join(number.split()[:4]) + (" ..." if number else "")
+        if total and verified == total:
+            mark = ("class:status.verified", f" all {total} verified ")
+        elif verified:
+            mark = ("class:status.unverified", f" {verified}/{total} verified ")
+        else:
+            mark = ("class:status.unverified", f" {total} unverified ")
 
         fragments = [
             mark,
-            ("class:status", " safety "),
-            ("class:status.number", short),
-            ("class:status", f"   sent {self.session.sent_count}"),
+            ("class:status", f"  sent {self.session.sent_count}"),
             ("class:status", f"  recv {self.session.recv_count}"),
         ]
-        if not self.session.can_send:
-            fragments.append(("class:status.unverified", "   waiting for first message"))
+
+        waiting = [p.user for p in peers.values() if not p.can_send]
+        if waiting:
+            fragments.append(
+                ("class:status.unverified",
+                 f"   waiting on {', '.join(sorted(waiting))}")
+            )
+        pending = self.session.pending_identity_changes
+        if pending:
+            fragments.append(
+                ("class:error", f"   key changed: {', '.join(pending)}")
+            )
         fragments.append(("class:status", " " * 200))
         return fragments
 
@@ -205,8 +228,19 @@ class ChatUI:
     def warning(self, text):
         self._add("warning", "", f"! {text}")
 
+    PEER_STYLES = ["peer", "peer2", "peer3", "peer4", "peer5"]
+
+    def _style_for(self, user):
+        """
+        Give each peer a stable colour, so who said what is readable at a
+        glance once there are more than two people talking.
+        """
+        index = sum(user.encode()) % len(self.PEER_STYLES)
+        return self.PEER_STYLES[index]
+
     def message(self, user, text, ts=None, own=False):
-        self._add("self" if own else "peer", f"{user}:", text, ts)
+        style = "self" if own else self._style_for(user)
+        self._add(style, f"{user}:", text, ts)
 
     # ---- events from the session --------------------------------------
 
@@ -225,8 +259,9 @@ class ChatUI:
             verb = "joined" if payload.get("joined") else "left"
             self.system(f"{payload.get('user')} {verb} the room")
         elif kind == "ready":
-            self.system(f"Secure session established with {payload.get('peer')}.")
-            self.system("Run /verify and compare the safety number out of band.")
+            peer = payload.get("peer")
+            self.system(f"Secure session established with {peer}.")
+            self.system(f"Run /verify {peer} and compare the digits out of band.")
         elif kind == "state":
             self.refresh()
         else:
@@ -245,7 +280,9 @@ class ChatUI:
             self.session.send_message(text)
 
     def _command(self, raw):
-        command = raw.split()[0].lower()
+        parts = raw.split()
+        command = parts[0].lower()
+        argument = parts[1] if len(parts) > 1 else None
 
         if command == "/quit":
             self.app.exit()
@@ -258,26 +295,88 @@ class ChatUI:
             self.entries.clear()
             self.refresh()
 
+        elif command == "/who":
+            self._who()
+
         elif command == "/verify":
-            if not self.session.safety_number:
-                self.error("No session yet -- nothing to verify.")
-                return
-            self.system("Safety number -- both of you must read the same digits:")
-            digits = self.session.safety_number.split()
-            for row in range(0, len(digits), 6):
-                self.system("    " + " ".join(digits[row:row + 6]))
-            self.system("Compare over a channel the relay does not control "
-                        "(in person, a phone call you both recognise).")
-            self.session.mark_verified()
+            self._verify(argument)
 
         elif command == "/trust":
-            if self.session.trust_new_identity():
-                self.system("Peer identity updated.")
-            else:
-                self.error("No pending identity change to accept.")
+            self._trust(argument)
 
         else:
             self.error(f"Unknown command {command}. Try /help.")
+
+    def _resolve_peer(self, name):
+        """
+        Resolve a peer argument, allowing it to be omitted when there is only
+        one peer -- which keeps the two-party case as short as it was.
+        """
+        members = self.session.member_names
+        if name is None:
+            if len(members) == 1:
+                return members[0]
+            if not members:
+                self.error("Nobody else is here yet.")
+            else:
+                self.error(f"Which one? {', '.join(members)}")
+            return None
+        if name not in members:
+            self.error(f"No peer called '{name}'. Here: {', '.join(members) or 'nobody'}")
+            return None
+        return name
+
+    def _who(self):
+        members = self.session.member_names
+        if not members:
+            self.system("Nobody else is in the room yet.")
+            return
+        self.system(f"{len(members)} peer{'s' if len(members) != 1 else ''} in #{self.room}:")
+        for name in members:
+            peer = self.session.peers[name]
+            flags = []
+            flags.append("verified" if peer.verified else "unverified")
+            if not peer.online:
+                flags.append("offline")
+            if not peer.can_send:
+                flags.append("no channel yet")
+            self.system(f"    {name:<16} {', '.join(flags)}"
+                        f"   sent {peer.sent} / recv {peer.received}")
+
+    def _verify(self, name):
+        peer_name = self._resolve_peer(name)
+        if peer_name is None:
+            return
+        number = self.session.safety_number_for(peer_name)
+        if not number:
+            self.error(f"No session with {peer_name} yet.")
+            return
+
+        self.system(f"Safety number for {peer_name} -- both of you must read "
+                    f"the same digits:")
+        digits = number.split()
+        for row in range(0, len(digits), 6):
+            self.system("    " + " ".join(digits[row:row + 6]))
+        self.system("Compare over a channel the relay does not control "
+                    "(in person, a call you both recognise).")
+        self.session.mark_verified(peer_name)
+
+    def _trust(self, name):
+        pending = self.session.pending_identity_changes
+        if name is None:
+            if len(pending) == 1:
+                name = pending[0]
+            elif not pending:
+                self.error("No pending identity change to accept.")
+                return
+            else:
+                self.error(f"Which one? {', '.join(pending)}")
+                return
+
+        if self.session.trust_new_identity(name):
+            self.system(f"Identity for {name} updated.")
+        else:
+            self.error(f"No pending identity change for '{name}'.")
 
     def _key_bindings(self):
         kb = KeyBindings()

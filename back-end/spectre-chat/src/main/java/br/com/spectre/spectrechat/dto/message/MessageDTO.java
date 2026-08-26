@@ -5,6 +5,7 @@ import java.time.Instant;
 public record MessageDTO(
         Long id,
         String sender,
+        String recipient,
         String headerJson,
         String bodyJson,
         Instant createdAt

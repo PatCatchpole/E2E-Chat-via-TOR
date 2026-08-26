@@ -298,3 +298,111 @@ stability.
 | Room says it is full | `SPECTRE_ROOM_CAPACITY` reached, or a stale client still holds a slot. |
 
 To start a room over, delete the saved state: `python client_cli.py --reset`.
+
+---
+
+## 10. Status
+
+### What was rebuilt
+
+The project began as a two-party chat whose cryptography and authentication had
+a number of defects. Everything below was reviewed, rewritten where necessary,
+and covered by tests that fail if the defect returns.
+
+**Cryptography**
+
+- X3DH now runs against a *signed* prekey, with separate initiator and responder
+  functions. Previously nothing authenticated the key bundles, so the relay
+  could substitute its own keys for both peers and read everything.
+- Identities are Ed25519 keys signing every published key, bound to the user and
+  room. Peer identities are pinned on first use, and a change is refused with a
+  warning until `/trust` accepts it.
+- The Double Ratchet follows the published algorithm: skipped-message keys,
+  previous-chain length in the header, automatic DH rotation. The old manual
+  `/rotate` is gone -- rotating twice without sending in between left the peer
+  unable to reach the new root key.
+- Message headers are authenticated as AEAD associated data. They were
+  unauthenticated, and a forged counter drove an unbounded key-derivation loop.
+- Key derivation uses real HKDF-SHA256 with domain separation.
+- Restoring saved state no longer re-runs a DH ratchet step, which used to
+  advance the root key past the peer's on every restart.
+- Decryption is atomic: a packet that fails to authenticate leaves the ratchet
+  exactly as it was. Without this one forged packet destroyed a session
+  permanently, and the damage was persisted.
+
+**Authentication**
+
+- The client sent a locally-computed bcrypt hash which the backend compared with
+  string equality, making the stored hash itself the credential. The client now
+  derives a PBKDF2 verifier and the backend applies randomly-salted bcrypt. The
+  deterministic client salt also makes signing in from a second machine
+  possible, which it previously was not.
+
+**Relay**
+
+- `packet` had no authentication at all: no session check, no room membership
+  check, and the sender was read from the client payload. Both are now enforced
+  and the sender comes from the server-side session.
+- CORS defaulted to `*`; it is now empty unless configured.
+- `leave` never called `leave_room`, so departed clients kept receiving traffic.
+- The internal token and full ciphertext were logged on every request.
+
+**Backend**
+
+- Token and database credentials come from the environment, and the service
+  refuses to start without them rather than using a committed default.
+- Typed exceptions replace bare 500s; requests are validated; writes are
+  transactional; migrations add the missing constraints and indexes.
+
+**Interface**
+
+- A full-screen chat screen, a sign-in screen and a room picker, replacing
+  interleaved `print()` and `input()` calls.
+
+**Group chat** — rooms are a mesh of pairwise sessions; see §1.
+
+### Outstanding
+
+1. **The Java backend has never been compiled.** No JDK 21 or Maven was
+   available while it was written, so it was reviewed by inspection only. Run
+   `mvn compile` in `back-end/spectre-chat` before trusting it. The Python side
+   is verified end to end against `tools/dev_backend.py`, which implements the
+   same HTTP contract, so the wire protocol is exercised even though the Java
+   is not.
+
+2. **Two private keys remain in git history** at commit `5b3f23f`
+   (`client/crypto/identity_key`, `client/crypto/ephemeral_key`). They are no
+   longer tracked, but untracking is not deletion -- they are still fetchable.
+   Treat them as burned regardless, and to remove them:
+
+   ```bash
+   git filter-repo --path client/crypto/identity_key \
+                   --path client/crypto/ephemeral_key --invert-paths
+   git remote add origin <url>      # filter-repo drops the remote deliberately
+   git push --force --all
+   ```
+
+   Every stored password hash predating the auth rewrite is also void; drop the
+   users table and have people register again.
+
+3. **This work lives on `harden-protocol`, not `main`.** A fresh clone gets the
+   old, broken code. Merge it when you are satisfied with it.
+
+### Possible next steps
+
+- **Sender keys.** Each member distributes one symmetric chain key over the
+  existing pairwise channels and then encrypts each message once, turning
+  O(n^2) traffic into O(n). It costs some post-compromise security -- a leaked
+  sender key stays useful until rotation -- and needs redistribution whenever
+  membership changes. The pairwise mesh is the transport it would be built on,
+  so it is an addition rather than a rewrite.
+- **Message retention.** Rows are never deleted. A TTL or an explicit purge
+  would limit what a seized database reveals, since the ciphertext is retained
+  forever today.
+- **Removing a member.** Nothing re-keys when somebody leaves. There is no group
+  key to rotate, so this needs a policy decision before it needs code.
+- **A vetted library.** If this ever needs to be trustworthy rather than
+  instructive, the honest move is binding `crypto/` to a reviewed
+  implementation. Hand-rolled primitives are the point of the project, not a
+  path to production.
+

@@ -159,18 +159,15 @@ def screen_details(args):
                 "url": url, "use_tor": use_tor, "room": room}
 
 
-def main():
-    args = parse_args()
-    storage.ensure_dirs()
+def run_session(details, reset: bool = False):
+    """
+    Connect, sign in, join the room and hand over to the chat UI.
 
-    # The full-screen screens need a real terminal; piped input falls back to
-    # plain prompts so scripts keep working.
-    use_screens = not args.classic and sys.stdin.isatty() and sys.stdout.isatty()
-    details = screen_details(args) if use_screens else classic_details(args)
-    if details is None:
-        return
-
-    if args.reset:
+    `details` is what the sign-in screens produce: user, password, url,
+    use_tor and room. Split out of `main` so `spectre.py` can drive exactly
+    this path after starting a relay, rather than re-implementing it.
+    """
+    if reset:
         storage.clear_state(details["user"], details["room"])
         print(f"Saved session for '{details['room']}' discarded.")
 
@@ -217,6 +214,19 @@ def main():
     finally:
         session.close()
         print("Disconnected.")
+
+
+def main():
+    args = parse_args()
+    storage.ensure_dirs()
+
+    # The full-screen screens need a real terminal; piped input falls back to
+    # plain prompts so scripts keep working.
+    use_screens = not args.classic and sys.stdin.isatty() and sys.stdout.isatty()
+    details = screen_details(args) if use_screens else classic_details(args)
+    if details is None:
+        return
+    run_session(details, reset=args.reset)
 
 
 if __name__ == "__main__":

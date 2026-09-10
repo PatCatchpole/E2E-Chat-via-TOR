@@ -17,6 +17,29 @@ cost is that traffic grows with the square of the room size, which is why
 
 ---
 
+## 0. Quick start
+
+Nothing to configure, and no second terminal:
+
+```bash
+python spectre.py
+```
+
+On macOS you can also double-click **Spectre.command** in Finder.
+
+It asks whether to host a room or join one. Hosting starts the relay and its
+backend for you and shows the address to pass to whoever is joining; joining
+just wants that address. Then it signs you in and drops you into the chat.
+
+> Hosting this way uses the in-memory backend (`tools/dev_backend.py`), so
+> **accounts and message history last only as long as the window stays open**.
+> For anything that should survive a restart, run the Spring Boot backend and
+> the relay yourself — see §4.
+
+Everything below is the manual path, which is still there and still works.
+
+---
+
 ## 1. Architecture
 
 Three processes:
@@ -37,8 +60,11 @@ client  <--- Socket.IO (Tor) --->  relay  <--- HTTP (loopback) --->  backend  --
 ### Layout
 
 ```text
+spectre.py            launcher: host or join, starts the relay, then signs in
+Spectre.command       double-clickable wrapper for Finder
 client/
-  client_cli.py       entry point, argument and prompt handling
+  client_cli.py       client entry point, argument and prompt handling
+  screens.py          start, sign-in and room-picker screens
   session.py          transport, handshake, message dispatch
   ui.py               full-screen terminal chat interface
   storage.py          0600 local persistence for keys and ratchet state

@@ -116,6 +116,135 @@ def _base_bindings(on_cancel):
     return kb
 
 
+# ------------------------------------------------------------ start screen
+
+HOST = "host"
+JOIN = "join"
+
+
+def start_screen(default: str = JOIN, message: str = ""):
+    """
+    Host a room on this machine, or join one somebody else is already hosting.
+
+    Returns HOST, JOIN, or None if the user quit. This is the only decision
+    that cannot be inferred: somebody has to run the relay, and nothing in the
+    saved state says whether that should be us.
+    """
+    error = {"text": message}
+
+    def submit():
+        app.exit(result=choices.current_value)
+
+    choices = SubmitOnEnterList(
+        values=[
+            (JOIN, "Join a room somebody else is hosting"),
+            (HOST, "Host a room on this machine"),
+        ],
+        on_submit=lambda: submit(),
+        default=default,
+    )
+
+    kb = _base_bindings(lambda event: event.app.exit(result=None))
+
+    body = HSplit([
+        Window(height=1),
+        Window(FormattedTextControl(_banner_block), height=len(BANNER) + 1),
+        Window(height=1),
+        Frame(
+            Box(choices, padding_left=1, padding_right=1,
+                padding_top=1, padding_bottom=1),
+            title="Start",
+        ),
+        Window(FormattedTextControl(lambda: [("class:error", error["text"])]), height=1),
+        VSplit([
+            Window(),
+            Button("Continue", handler=submit, width=13),
+            Window(width=2),
+            Button("Quit", handler=lambda: app.exit(result=None), width=10),
+            Window(),
+        ], height=1),
+        Window(height=1),
+        Window(FormattedTextControl([
+            ("class:hint", "Up / Down choose   Enter continues   Esc quits")
+        ]), height=1),
+    ])
+
+    root = Box(body, padding_left=4, padding_right=4)
+    app = Application(
+        layout=Layout(root, focused_element=choices),
+        key_bindings=kb, style=STYLE, full_screen=True, mouse_support=False,
+    )
+    return app.run()
+
+
+# ------------------------------------------------------- hosting confirmed
+
+
+def host_ready_screen(addresses: list):
+    """
+    Show where the relay is listening so the address can be read out.
+
+    `addresses` is a list of (label, value) pairs. Returns True to carry on to
+    sign in, or None to quit -- quitting here stops the relay again, so it has
+    to be distinguishable from continuing.
+    """
+    def submit():
+        app.exit(result=True)
+
+    rows = [Window(height=1)]
+    for label, value in addresses:
+        rows.append(_labelled(label, Window(
+            FormattedTextControl([("class:peer", value)]), height=1,
+        ), label_width=12))
+    rows.append(Window(height=1))
+    rows.append(Window(FormattedTextControl([
+        ("class:dim", "Anyone on your network can join with the address above.")
+    ]), height=1))
+    rows.append(Window(FormattedTextControl([
+        ("class:dim", "Closing this window stops the relay and ends the room.")
+    ]), height=1))
+    # The launcher hosts with the in-memory backend, so this is not a detail
+    # somebody should discover by losing their account.
+    rows.append(Window(FormattedTextControl([
+        ("class:error", "Accounts and history are kept in memory only, and are lost on exit.")
+    ]), height=1))
+
+    kb = _base_bindings(lambda event: event.app.exit(result=None))
+
+    @kb.add("enter")
+    def _(event):
+        submit()
+
+    body = HSplit([
+        Window(height=1),
+        Window(FormattedTextControl(_banner_block), height=len(BANNER) + 1),
+        Window(height=1),
+        Frame(
+            Box(HSplit(rows), padding_left=1, padding_right=1),
+            title="Hosting",
+        ),
+        Window(height=1),
+        VSplit([
+            Window(),
+            Button("Sign in", handler=submit, width=13),
+            Window(width=2),
+            Button("Quit", handler=lambda: app.exit(result=None), width=10),
+            Window(),
+        ], height=1),
+        Window(height=1),
+        Window(FormattedTextControl([
+            ("class:hint", "Enter signs in   Esc stops the relay and quits")
+        ]), height=1),
+    ])
+
+    root = Box(body, padding_left=4, padding_right=4)
+    app = Application(
+        layout=Layout(root, focused_element=body),
+        key_bindings=kb, style=STYLE, full_screen=True, mouse_support=False,
+    )
+    return app.run()
+
+
 # ---------------------------------------------------------------- sign in
 
 

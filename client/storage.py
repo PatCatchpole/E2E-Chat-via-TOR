@@ -108,6 +108,48 @@ def save_identity_seed(user: str, seed: bytes) -> None:
     _write_private(identity_path(user), seed)
 
 
+# ---- launcher: relay token and remembered settings --------------------
+
+
+def relay_token_path() -> Path:
+    return SPECTRE_DIR / "relay_token"
+
+
+def load_relay_token():
+    """
+    The shared /internal/** secret used when this machine hosts a relay.
+
+    Not session key material -- it authenticates the relay to the backend, and
+    both are ours -- but it is still a secret, so it is written 0600 like
+    everything else here.
+    """
+    path = relay_token_path()
+    if not path.exists():
+        return None
+    token = path.read_text(encoding="utf-8").strip()
+    return token or None
+
+
+def save_relay_token(token: str) -> None:
+    _write_private(relay_token_path(), token.encode("utf-8"))
+
+
+def launcher_prefs_path() -> Path:
+    return SPECTRE_DIR / "launcher.json"
+
+
+def load_launcher_prefs() -> dict:
+    """Last relay address and username, so the launcher can prefill them."""
+    return _read_json(launcher_prefs_path()) or {}
+
+
+def save_launcher_prefs(prefs: dict) -> None:
+    # Written 0600 with everything else: it names who you talk to and where,
+    # which is exactly the metadata the rest of this directory protects. No
+    # password is ever stored.
+    _write_private(launcher_prefs_path(), json.dumps(prefs).encode("utf-8"))
+
+
 # ---- ratchet state ----------------------------------------------------
 
 

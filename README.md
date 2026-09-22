@@ -486,33 +486,44 @@ packet queue grew without bound; sign-in had no rate limiting at all.
    The service still needs running against a real Postgres; it compiles and its
    unit tests pass, which is not the same thing.
 
-2. **Two private keys are still published, and the fix below was wrong.**
-   `client/crypto/identity_key` and `client/crypto/ephemeral_key` are reachable
-   from `origin/main`, `origin/harden-protocol` and `origin/back-end-tor` in a
-   **public** repository. They are not merely "in local history".
+2. **The two private keys are out of every branch, but not un-published.**
+   History was rewritten with `git filter-repo` across all five branches and
+   force-pushed. `client/crypto/identity_key` and `client/crypto/ephemeral_key`
+   no longer exist in any commit, and a fresh clone carries nothing.
 
-   The recipe here used to strip only the `client/crypto/` paths. The files
-   were added at `crypto/` and moved later, so the same blobs sit at both
-   paths — `identity_key` is blob `73f21406` at each — and stripping one leaves
-   the other. Both sets have to go:
+   The rewrite had to cover four paths, not two: the files were added at
+   `crypto/` and moved to `client/crypto/` later, so the same blob sits at both
+   (`identity_key` is `73f21406` at each) and stripping one leaves the other.
+   `frontend` and `tor-test` also carried them, despite not descending from the
+   commit the old note named — they were found by searching for the blob rather
+   than by ancestry.
 
    ```bash
-   git filter-repo --invert-paths \
+   git filter-repo --force --invert-paths \
        --path crypto/identity_key        --path crypto/ephemeral_key \
        --path client/crypto/identity_key --path client/crypto/ephemeral_key
    git remote add origin <url>      # filter-repo drops the remote deliberately
-   git push --force --all
+   git push --force --all origin
    ```
 
-   **This does not un-publish them.** The repository has a fork
-   (`kauan-novello/E2E-Chat-via-TOR`), and a fork is a separate repository that
-   your force-push does not touch; GitHub also keeps objects reachable through
-   the fork network. Anyone who cloned already has them regardless. The rewrite
-   is hygiene — it stops the keys being handed to the next person who clones —
-   but the keys themselves are permanently burned and their only real
-   remediation is that they are never used again. They are not: the identity
-   seed is generated per user in `~/.spectre` and nothing in the repo is
-   loadable as a key any more.
+   **What that did not do.** The repository is public and has a fork
+   (`kauan-novello/E2E-Chat-via-TOR`). A fork is a separate repository, and
+   GitHub serves objects across a fork network, so the old commits are still
+   fetchable by SHA from both URLs:
+
+   ```
+   raw.githubusercontent.com/PatCatchpole/E2E-Chat-via-TOR/d8b7f0a/crypto/identity_key        200
+   raw.githubusercontent.com/PatCatchpole/E2E-Chat-via-TOR/5b3f23f/client/crypto/identity_key 200
+   ```
+
+   Removing that needs GitHub Support to purge the fork network's cached
+   objects, and the fork itself deleted or rewritten by its owner. Until then
+   the keys are retrievable by anyone who knows the SHA.
+
+   None of which matters for safety, because the keys are burned and unused:
+   identity seeds are generated per user into `~/.spectre` and nothing in the
+   repository is loadable as a key. The rewrite's real value is that the next
+   person to clone does not receive them.
 
    Every stored password hash predating the auth rewrite is also void; drop the
    users table and have people register again.

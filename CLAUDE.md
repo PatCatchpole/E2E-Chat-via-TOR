@@ -106,11 +106,10 @@ Each of these was a live vulnerability; each has a test that fails if it returns
   SocksPort, so it never fights a system daemon or Tor Browser. The service key
   there is what keeps the `.onion` address stable — treat it as key material.
 - `dev.env` is gitignored and holds a placeholder token; never commit a real one.
-- Never add key material to the repo. Two private keys are still reachable in
-  git history at **both** `crypto/` and `client/crypto/` (they were moved), on
-  a public repo that has a fork — so they are burned permanently, not merely
-  untracked. README §10.2 has the full path list; stripping only one of the two
-  locations leaves the identical blob behind.
+- Never add key material to the repo. The two private keys were stripped from
+  all five branches with `git filter-repo` and force-pushed, so no commit
+  contains them now. They remain fetchable by old SHA through GitHub's fork
+  network (README §10.2) and are permanently burned — never reuse them.
 - Work lives on `harden-protocol`; `main` is the old, vulnerable code.
 - Plain `mvn test` fails on `SpectreChatApplicationTests.contextLoads`: it is a
   `@SpringBootTest` and needs `SPECTRE_DB_PASSWORD` and a live Postgres. That

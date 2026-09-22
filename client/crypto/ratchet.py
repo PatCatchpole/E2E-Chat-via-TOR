@@ -51,6 +51,15 @@ MAX_SKIP = 1000
 # gaps cannot grow our state without limit.
 MAX_SKIPPED_KEYS = 2000
 
+# Retired peer DH keys kept for the stale-replay check below. One entry is
+# added per DH rotation, so an unbounded set grows for the whole life of a
+# conversation -- and it is re-serialised on every message save, which turns a
+# long session into hundreds of kilobytes written per message. Evicting the
+# oldest is safe: the check is a clearer error, not the actual guard. A stale
+# packet that slips past it still fails the AEAD tag and is rolled back whole
+# by `decrypt`.
+MAX_RETIRED_DH = 128
+
 
 class RatchetError(Exception):
     """Raised for any message this ratchet refuses to accept."""
@@ -91,8 +100,9 @@ class DoubleRatchet:
         self.skipped = {}  # (peer_dh_public, n) -> message key
         # Peer DH keys we have already ratcheted past. A packet carrying one of
         # these is stale -- a backlog replay or a relay re-sending an old
-        # message -- and must never be mistaken for a new key.
-        self.retired_dh = set()
+        # message -- and must never be mistaken for a new key. A dict rather
+        # than a set so the oldest can be evicted first; the values are unused.
+        self.retired_dh = {}
 
     # ---- initial state ------------------------------------------------
 
@@ -174,7 +184,7 @@ class DoubleRatchet:
             self.root_key, self.dh_pair, self.peer_dh_public,
             self.sending_chain, self.receiving_chain,
             self.send_count, self.recv_count, self.previous_chain_length,
-            dict(self.skipped), set(self.retired_dh),
+            dict(self.skipped), dict(self.retired_dh),
         )
 
     def _restore_state(self, snapshot: tuple) -> None:
@@ -280,13 +290,18 @@ class DoubleRatchet:
         while len(self.skipped) > MAX_SKIPPED_KEYS:
             self.skipped.pop(next(iter(self.skipped)))
 
+    def _trim_retired(self) -> None:
+        while len(self.retired_dh) > MAX_RETIRED_DH:
+            self.retired_dh.pop(next(iter(self.retired_dh)))
+
     def _dh_ratchet(self, peer_dh: bytes) -> None:
         """One full DH ratchet step: new receiving chain, then new sending chain."""
         self.previous_chain_length = self.send_count
         self.send_count = 0
         self.recv_count = 0
         if self.peer_dh_public is not None:
-            self.retired_dh.add(self.peer_dh_public)
+            self.retired_dh[self.peer_dh_public] = None
+            self._trim_retired()
         self.peer_dh_public = peer_dh
 
         self.root_key, self.receiving_chain = _kdf_rk(self.root_key, dh(self.dh_pair, peer_dh))

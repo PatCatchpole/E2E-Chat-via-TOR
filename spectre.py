@@ -17,10 +17,12 @@ be done by hand -- see README §4.
 
 from __future__ import annotations
 
+import argparse
 import atexit
 import os
 import secrets
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -44,6 +46,12 @@ PREFERRED_RELAY_PORT = 5055
 PREFERRED_BACKEND_PORT = 8090
 
 STARTUP_TIMEOUT = 20
+
+# Homebrew does not put tor on a login shell's PATH for every setup, so the
+# usual install locations are checked too rather than failing with "not found"
+# on a machine that has it.
+TOR_BINARIES = ("tor", "/opt/homebrew/bin/tor", "/usr/local/bin/tor", "/usr/bin/tor")
+TOR_BOOTSTRAP_TIMEOUT = 120
 
 
 # ---------------------------------------------------------------- guards
@@ -285,6 +293,142 @@ class LocalRelay:
         return rows
 
 
+class TorHiddenService:
+    """
+    Publishes the relay as a v3 onion service, for as long as we run.
+
+    Self-contained under ~/.spectre/tor: its own DataDirectory, its own torrc
+    and its own SocksPort, so it neither needs root nor collides with a system
+    `tor` daemon or an open Tor Browser. Nothing in /etc is touched.
+
+    The service key in `spectre/` is what makes the address yours, and it is
+    kept across runs so an address you have handed out keeps working. Tor
+    refuses to start unless that directory is 0700, which is the same standard
+    the rest of ~/.spectre is held to.
+    """
+
+    def __init__(self, relay_port: int):
+        self.relay_port = relay_port
+        self.root = Path.home() / ".spectre" / "tor"
+        self.service_dir = self.root / "spectre"
+        # Our own SOCKS port: 9050 and 9150 may already be taken by a daemon
+        # or by Tor Browser, and starting a second tor on a used port fails.
+        self.socks_port = _free_port(9250)
+        self.process = None
+        self.handle = None
+        self.hostname = None
+
+    # -- lifecycle --
+
+    @staticmethod
+    def binary():
+        for candidate in TOR_BINARIES:
+            path = shutil.which(candidate)
+            if path:
+                return path
+        return None
+
+    def start(self) -> None:
+        binary = self.binary()
+        if binary is None:
+            raise RuntimeError(
+                "tor is not installed, so the room cannot be published as an "
+                "onion service.\n  Install it with:  brew install tor\n"
+                "  Then run this again with --tor, or host without it."
+            )
+
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (self.root / "data").mkdir(mode=0o700, parents=True, exist_ok=True)
+        for directory in (self.root, self.root / "data"):
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+
+        torrc = self.root / "torrc"
+        torrc.write_text(
+            "# Written by spectre.py. Self-contained: no system tor config.\n"
+            f"SocksPort {self.socks_port}\n"
+            f"DataDirectory {self.root / 'data'}\n"
+            f"HiddenServiceDir {self.service_dir}\n"
+            f"HiddenServicePort 80 127.0.0.1:{self.relay_port}\n"
+            f"Log notice file {self.root / 'tor.log'}\n",
+            encoding="utf-8",
+        )
+        os.chmod(torrc, 0o600)
+
+        log_path = self.root / "tor.log"
+        log_path.unlink(missing_ok=True)
+
+        descriptor = os.open(self.root / "startup.log",
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        self.handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        self.process = subprocess.Popen(
+            [binary, "-f", str(torrc)],
+            cwd=str(ROOT), stdout=self.handle, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            # Same reasoning as the relay: its own process group so the Ctrl-C
+            # that stops the chat does not kill it mid-publish.
+            start_new_session=(os.name != "nt"),
+        )
+
+        self.hostname = self._await_hostname()
+        atexit.register(self.stop)
+
+    def _await_hostname(self) -> str:
+        """Wait for tor to bootstrap and publish, or explain why it did not."""
+        deadline = time.time() + TOR_BOOTSTRAP_TIMEOUT
+        hostname_file = self.service_dir / "hostname"
+        log_path = self.root / "tor.log"
+
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(self._failure("exited"))
+            if hostname_file.exists():
+                try:
+                    log = log_path.read_text(encoding="utf-8")
+                except OSError:
+                    log = ""
+                if "Bootstrapped 100%" in log:
+                    return hostname_file.read_text(encoding="utf-8").strip()
+            time.sleep(1.0)
+
+        raise RuntimeError(self._failure("did not finish bootstrapping"))
+
+    def _failure(self, what: str) -> str:
+        detail = ""
+        for candidate in (self.root / "tor.log", self.root / "startup.log"):
+            try:
+                tail = candidate.read_text(encoding="utf-8").strip().splitlines()[-6:]
+            except OSError:
+                continue
+            if tail:
+                detail = "\n    ".join(tail)
+                break
+        return (
+            f"tor {what}.\n"
+            f"  Log: {self.root / 'tor.log'}\n"
+            + (f"    {detail}" if detail else "")
+        )
+
+    def stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            except OSError:
+                pass
+        self.process = None
+        if self.handle is not None:
+            try:
+                self.handle.close()
+            except OSError:
+                pass
+            self.handle = None
+
+
 def _relay_token() -> str:
     """Reuse the machine's token so a restart does not orphan stored accounts."""
     import storage
@@ -336,7 +480,22 @@ def _sign_in(screens, storage, client_cli, relay_default: str, hosting: bool):
         }
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        prog="spectre.py",
+        description="Start Spectre: host a room or join one.",
+    )
+    parser.add_argument(
+        "--tor", action="store_true",
+        help="when hosting, also publish the room as a Tor onion service so "
+             "people can join from anywhere. Joining over Tor needs no flag -- "
+             "just paste the .onion address.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
     _require(CLIENT_DEPENDENCIES, "client dependencies")
 
     import client_cli
@@ -359,6 +518,7 @@ def main() -> None:
         return
 
     relay = None
+    onion = None
     try:
         if choice == screens.HOST:
             relay = LocalRelay(_relay_token())
@@ -368,7 +528,21 @@ def main() -> None:
             except RuntimeError as error:
                 sys.exit(str(error))
 
-            if screens.host_ready_screen(relay.addresses()) is None:
+            if args.tor:
+                # Publishing reaches the whole Tor network, so it is opt-in
+                # rather than something hosting does on your behalf.
+                print("Publishing the onion service (this takes a minute) ...")
+                onion = TorHiddenService(relay.relay_port)
+                try:
+                    onion.start()
+                except RuntimeError as error:
+                    onion = None
+                    print(f"\nCould not publish over Tor: {error}\n"
+                          f"Carrying on with the local room only.\n")
+
+            if screens.host_ready_screen(
+                    relay.addresses(),
+                    onion=onion.hostname if onion else None) is None:
                 return
             relay_default = f"127.0.0.1:{relay.relay_port}"
         else:
@@ -381,6 +555,9 @@ def main() -> None:
 
         client_cli.run_session(details)
     finally:
+        if onion is not None:
+            print("Stopping the onion service ...")
+            onion.stop()
         if relay is not None:
             print("Stopping the relay ...")
             relay.stop()

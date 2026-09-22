@@ -27,6 +27,12 @@ python spectre.py
 
 On macOS you can also double-click **Spectre.command** in Finder.
 
+To let people join from anywhere rather than just your network, host with Tor:
+
+```bash
+python spectre.py --tor
+```
+
 It asks whether to host a room or join one. Hosting starts the relay and its
 backend for you and shows the address to pass to whoever is joining; joining
 just wants that address. Then it signs you in and drops you into the chat.
@@ -88,7 +94,9 @@ back-end/spectre-chat Spring Boot service
 - Python 3.9+
 - Java 21 and Maven (the backend targets Spring Boot 4)
 - PostgreSQL
-- Tor, for `.onion` operation (Tor Browser, or a `tor` daemon)
+- Tor, for `.onion` operation — a `tor` daemon (`brew install tor`) or Tor
+  Browser. `spectre.py --tor` needs the daemon on PATH; joining an existing
+  `.onion` works with either.
 
 ---
 
@@ -115,6 +123,10 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | `SPECTRE_ROOM_CAPACITY` | relay | Maximum members per room. Defaults to 8. |
 | `SPECTRE_ALLOW_DEV_SERVER` | relay | Set to `1` to run the Werkzeug dev server non-interactively (systemd, docker). |
 | `SPECTRE_LOG_LEVEL` | relay | Defaults to `INFO`. |
+| `SPECTRE_AUTH_RATE` | relay | Sign-in attempts per username per 5 minutes. Defaults to 10. |
+| `SPECTRE_AUTH_RATE_SOCKET` | relay | Sign-in attempts per socket per 5 minutes. Defaults to 20. |
+| `SPECTRE_PACKET_RATE` | relay | Packets per socket per 10 seconds. Defaults to 240. |
+| `SPECTRE_TOR_SOCKS_PORT` | client | Pins the SOCKS port. Otherwise 9050 then 9150 are tried. |
 
 ---
 
@@ -240,11 +252,33 @@ before running `/trust`.
 
 ## 6. Running via Tor
 
-Add to your `torrc`:
+The launcher does the whole thing:
+
+```bash
+python spectre.py --tor
+```
+
+Choose **Host**, and the room is published as a v3 onion service whose address
+is shown next to the local one. Whoever is joining pastes that address into the
+relay field — joining needs no flag and no configuration.
+
+Everything lives under `~/.spectre/tor`: its own `torrc`, its own
+`DataDirectory` and its own `SocksPort`. Nothing in `/etc` is touched and no
+root is needed, so it cannot collide with a system `tor` daemon or with Tor
+Browser. The service key in `~/.spectre/tor/spectre/` is kept between runs, so
+an address you have handed out keeps working — it is key material, and Tor
+refuses to start unless that directory is `0700`.
+
+Publishing is opt-in because it makes the relay reachable from the entire Tor
+network. Hosting without `--tor` stays on your own network.
+
+### By hand
+
+If you would rather run the hidden service yourself, add to your `torrc`:
 
 ```
 HiddenServiceDir /var/lib/tor/spectre/
-HiddenServicePort 80 127.0.0.1:5000
+HiddenServicePort 80 127.0.0.1:5055
 ```
 
 Read the hostname from `/var/lib/tor/spectre/hostname`, then:
@@ -254,11 +288,16 @@ cd client
 python client_cli.py --onion <host>.onion
 ```
 
-The client proxies through SOCKS5 at `127.0.0.1:9150` (Tor Browser). For a
-standalone `tor` daemon, change `TOR_SOCKS_PORT` in `client/session.py` to 9050.
-Hostname resolution goes through `socks5h`, so `.onion` lookups stay inside Tor.
+The client finds the SOCKS proxy itself, trying `9050` (a `tor` daemon) and
+then `9150` (Tor Browser). `SPECTRE_TOR_SOCKS_PORT` pins it if you need it to.
+Hostname resolution goes through `socks5h`, so `.onion` lookups stay inside
+Tor.
 
----
+It tries each port by connecting through it rather than by checking that
+something is listening, because those are not the same thing: Tor Browser
+starts its `tor` with `DisableNetwork 1` and only lifts it when you click
+Connect, so an open-but-unconnected Tor Browser holds 9150 while routing
+nothing.
 
 ## 7. Threat model
 
@@ -279,9 +318,19 @@ Hostname resolution goes through `socks5h`, so `.onion` lookups stay inside Tor.
 **Not protected against**
 
 - **Metadata.** The relay and backend see who talks to whom, when, and how
-  often. Message rows are never deleted. Tor hides network location, not this.
+  often. Message rows are never deleted. Tor hides network location, not this —
+  behind a hidden service every client appears to the relay as `127.0.0.1`.
 - **An unverified identity key.** Signatures prove a bundle is self-consistent,
   not that it belongs to your peer. Only `/verify` establishes that.
+- **The transport, unless it is Tor.** The relay speaks plain HTTP. Message
+  contents are safe either way — they are already end-to-end encrypted before
+  they reach it — but the login verifier is not: it is the value the backend
+  checks, so anyone who can watch the connection can capture it and sign in as
+  you. Over Tor the circuit is encrypted and this does not arise. On a LAN or
+  across the internet without Tor it does, including the address the launcher
+  offers under "Share this". Host with `--tor`, or put TLS in front of the
+  relay.
+
 - **A compromised endpoint.** Ratchet state on disk is 0600 but not encrypted at
   rest; anyone who can read your files can read your session.
 - **Traffic analysis.** No padding, no cover traffic; message sizes and timing
@@ -300,12 +349,29 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 ```
 
-The suite covers the protocol properties directly: out-of-order and dropped
-messages, both peers ratcheting simultaneously, save/restore across a restart,
-replay and stale-chain rejection, forged header counters, tampered headers and
-ciphertext, rollback after a failed authentication, bundle signature forgery,
-per-peer identity changes, role derivation, payload framing, and safety number
-stability.
+102 tests. The suite covers the protocol properties directly: out-of-order and
+dropped messages, both peers ratcheting simultaneously, save/restore across a
+restart, replay and stale-chain rejection, forged header counters, tampered
+headers and ciphertext, rollback after a failed authentication, bundle
+signature forgery, per-peer identity changes, role derivation, payload framing,
+and safety number stability.
+
+It also covers the parts that are not cryptography but were the easiest place
+for a defect to come back unnoticed: the relay taking the sender from its own
+session, room membership on every packet, a departed client leaving the
+broadcast room, rate limiting, `0600` on everything written to disk, storage
+paths that cannot collide, and delivery of a message whose id sits below a
+stale watermark.
+
+The Java side has its own:
+
+```bash
+cd back-end/spectre-chat && mvn test -Dtest=MessageWireFormatTest
+```
+
+which pins the wire format of a stored message — see §10. It is scoped on
+purpose: plain `mvn test` also runs `contextLoads`, which needs a live
+Postgres and `SPECTRE_DB_PASSWORD`.
 
 ---
 
@@ -387,26 +453,66 @@ and covered by tests that fail if the defect returns.
 
 **Group chat** — rooms are a mesh of pairwise sessions; see §1.
 
+**Tor** — `spectre.py --tor` publishes the room as a v3 onion service, managed
+under `~/.spectre/tor` with no root and no system configuration; see §6.
+
+**Later fixes** — a persisted delivery watermark silently discarded genuinely
+new messages whenever the in-memory backend restarted its ids at 1; storage
+filenames could collide between two different pairwise sessions, which would
+have had two ratchets sharing one state file; `retired_dh` and the pending-
+packet queue grew without bound; sign-in had no rate limiting at all.
+
 ### Outstanding
 
-1. **The Java backend has never been compiled.** No JDK 21 or Maven was
-   available while it was written, so it was reviewed by inspection only. Run
-   `mvn compile` in `back-end/spectre-chat` before trusting it. The Python side
-   is verified end to end against `tools/dev_backend.py`, which implements the
-   same HTTP contract, so the wire protocol is exercised even though the Java
-   is not.
+1. **The Java backend now compiles, and did not survive first contact.**
+   It had never been built when it was written, and once it was, it turned out
+   to be destroying every message it stored. `MessageHeaderDTO` declared
+   `(dh_pub_b64, n)` and `MessageBodyDTO` declared `(nonce_b64, ct_b64)`, while
+   the ratchet emits `(dh, pn, n)` and `(nonce, ct)`. Jackson dropped every
+   field whose name did not match, so a stored message was
+   `{"dh_pub_b64":null,"n":3}` and `{"nonce_b64":null,"ct_b64":null}` — the DH
+   public key, the previous-chain length and the ciphertext itself, all gone on
+   the way into the database. Offline delivery was therefore broken end to end,
+   and nothing caught it because the Python side is exercised against
+   `tools/dev_backend.py`, which stores the JSON verbatim.
 
-2. **Two private keys remain in git history** at commit `5b3f23f`
-   (`client/crypto/identity_key`, `client/crypto/ephemeral_key`). They are no
-   longer tracked, but untracking is not deletion -- they are still fetchable.
-   Treat them as burned regardless, and to remove them:
+   Both records are gone. The header and body are carried as opaque JSON, which
+   is what the backend should have been doing anyway: it holds ciphertext it
+   must not interpret, and the header is AEAD associated data that has to come
+   back byte for byte or the tag will not verify. A typed record cannot promise
+   that — it silently destroys anything it was not told about, which would make
+   any future header field a wire break. `MessageWireFormatTest` pins it.
+
+   The service still needs running against a real Postgres; it compiles and its
+   unit tests pass, which is not the same thing.
+
+2. **Two private keys are still published, and the fix below was wrong.**
+   `client/crypto/identity_key` and `client/crypto/ephemeral_key` are reachable
+   from `origin/main`, `origin/harden-protocol` and `origin/back-end-tor` in a
+   **public** repository. They are not merely "in local history".
+
+   The recipe here used to strip only the `client/crypto/` paths. The files
+   were added at `crypto/` and moved later, so the same blobs sit at both
+   paths — `identity_key` is blob `73f21406` at each — and stripping one leaves
+   the other. Both sets have to go:
 
    ```bash
-   git filter-repo --path client/crypto/identity_key \
-                   --path client/crypto/ephemeral_key --invert-paths
+   git filter-repo --invert-paths \
+       --path crypto/identity_key        --path crypto/ephemeral_key \
+       --path client/crypto/identity_key --path client/crypto/ephemeral_key
    git remote add origin <url>      # filter-repo drops the remote deliberately
    git push --force --all
    ```
+
+   **This does not un-publish them.** The repository has a fork
+   (`kauan-novello/E2E-Chat-via-TOR`), and a fork is a separate repository that
+   your force-push does not touch; GitHub also keeps objects reachable through
+   the fork network. Anyone who cloned already has them regardless. The rewrite
+   is hygiene — it stops the keys being handed to the next person who clones —
+   but the keys themselves are permanently burned and their only real
+   remediation is that they are never used again. They are not: the identity
+   seed is generated per user in `~/.spectre` and nothing in the repo is
+   loadable as a key any more.
 
    Every stored password hash predating the auth rewrite is also void; drop the
    users table and have people register again.

@@ -12,6 +12,7 @@ interrupted save cannot leave a truncated state file behind.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -32,6 +33,39 @@ def _safe_name(value: str) -> str:
     """Keep user- and room-supplied names from escaping the storage directory."""
     cleaned = "".join(c if c.isalnum() or c in "-_." else "_" for c in value)
     return cleaned.strip("._") or "unnamed"
+
+
+def _key(*parts: str) -> str:
+    """
+    Eight hex characters binding the exact originals of a path's components.
+
+    `_safe_name` is lossy and the parts are joined with "__", which the parts
+    themselves may contain -- so without this, (room "x__y", peer "z") and
+    (room "x", peer "y__z") name the same file. Two distinct pairwise sessions
+    sharing one state file is a key-reuse bug, so the tuple is hashed
+    length-prefixed and the digest goes in the filename.
+    """
+    digest = hashlib.sha256()
+    for part in parts:
+        encoded = part.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big") + encoded)
+    return digest.hexdigest()[:8]
+
+
+def _resolve(path: Path, legacy: Path) -> Path:
+    """
+    Move a file written before `_key` existed to its current name.
+
+    The directory globs match both spellings, so listings were never affected;
+    only the direct lookups would otherwise miss a session saved by an older
+    build and silently renegotiate it.
+    """
+    if not path.exists() and legacy.exists():
+        try:
+            os.replace(legacy, path)
+        except OSError:
+            return legacy
+    return path
 
 
 def ensure_dirs() -> None:
@@ -94,7 +128,10 @@ def check_permissions(path: Path) -> bool:
 
 
 def identity_path(user: str) -> Path:
-    return SPECTRE_DIR / f"{_safe_name(user)}.identity"
+    return _resolve(
+        SPECTRE_DIR / f"{_safe_name(user)}__{_key(user)}.identity",
+        SPECTRE_DIR / f"{_safe_name(user)}.identity",
+    )
 
 
 def load_identity_seed(user: str):
@@ -156,7 +193,11 @@ def save_launcher_prefs(prefs: dict) -> None:
 def state_path(user: str, room: str, peer: str) -> Path:
     # One ratchet per (room, peer): a group is a mesh of pairwise sessions, so
     # state cannot be keyed by room alone.
-    return STATE_DIR / f"{_safe_name(user)}__{_safe_name(room)}__{_safe_name(peer)}.json"
+    stem = f"{_safe_name(user)}__{_safe_name(room)}__{_safe_name(peer)}"
+    return _resolve(
+        STATE_DIR / f"{stem}__{_key(user, room, peer)}.json",
+        STATE_DIR / f"{stem}.json",
+    )
 
 
 def load_state(user: str, room: str, peer: str):
@@ -191,7 +232,11 @@ def clear_state(user: str, room: str, peer: str = None) -> None:
 
 
 def peer_path(user: str, room: str, peer: str) -> Path:
-    return PEERS_DIR / f"{_safe_name(user)}__{_safe_name(room)}__{_safe_name(peer)}.json"
+    stem = f"{_safe_name(user)}__{_safe_name(room)}__{_safe_name(peer)}"
+    return _resolve(
+        PEERS_DIR / f"{stem}__{_key(user, room, peer)}.json",
+        PEERS_DIR / f"{stem}.json",
+    )
 
 
 def load_known_peer(user: str, room: str, peer: str):
@@ -212,7 +257,16 @@ def save_known_peer(user: str, room: str, peer_user: str, identity_b64: str) -> 
 
 
 def progress_path(user: str, room: str) -> Path:
-    return STATE_DIR / f"{_safe_name(user)}__{_safe_name(room)}.progress.json"
+    # The "__{key}" is also what brings this file inside clear_state's glob.
+    # Named "user__room.progress.json" it sat outside the "user__room__*"
+    # pattern, so --reset discarded the ratchets and kept the delivery
+    # watermark -- which then suppressed the very backlog the reset was
+    # meant to replay.
+    stem = f"{_safe_name(user)}__{_safe_name(room)}"
+    return _resolve(
+        STATE_DIR / f"{stem}__{_key(user, room)}.progress.json",
+        STATE_DIR / f"{stem}.progress.json",
+    )
 
 
 def load_progress(user: str, room: str) -> dict:

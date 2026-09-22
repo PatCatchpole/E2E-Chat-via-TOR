@@ -35,6 +35,13 @@ import java.util.List;
 public class InternalMessageController {
 
     private static final Logger log = LoggerFactory.getLogger(InternalMessageController.class);
+
+    /**
+     * Mirrors MAX_PACKET_BYTES in the relay. The relay checks this already;
+     * the backend does not take its word for it, because /internal/** is
+     * reachable by anything holding the token.
+     */
+    private static final int MAX_PAYLOAD_CHARS = 64 * 1024;
     private final UserRepository userRepo;
     private final RoomRepository roomRepo;
     private final MessageRepository msgRepo;
@@ -60,8 +67,13 @@ public class InternalMessageController {
                             "No such recipient: " + req.recipient()));
         }
 
+        // writeValueAsString on a JsonNode returns what arrived, unchanged.
         String headerJson = mapper.writeValueAsString(req.header());
         String bodyJson   = mapper.writeValueAsString(req.body());
+
+        if (headerJson.length() > MAX_PAYLOAD_CHARS || bodyJson.length() > MAX_PAYLOAD_CHARS) {
+            return ResponseEntity.badRequest().build();
+        }
 
         Message m = Message.builder()
                 .room(room)

@@ -26,6 +26,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 import requests
 from flask import Flask, request
@@ -69,6 +70,24 @@ MAX_PACKET_BYTES = 64 * 1024
 
 BACKEND_TIMEOUT = 5
 
+# Credential guessing was unmetered: the relay forwarded every login straight
+# to the backend, so an attacker could grind verifiers as fast as the network
+# allowed, and each attempt costs the backend a bcrypt(12).
+#
+# The buckets are keyed by username and by socket, never by IP. Behind a Tor
+# hidden service every connection arrives from 127.0.0.1, so an IP bucket
+# would put every user in the world in one bucket and let one attacker lock
+# the room out for everybody.
+AUTH_ATTEMPTS_PER_USER = int(os.environ.get("SPECTRE_AUTH_RATE", "10"))
+AUTH_ATTEMPTS_PER_SOCKET = int(os.environ.get("SPECTRE_AUTH_RATE_SOCKET", "20"))
+AUTH_WINDOW_SECONDS = 300
+
+# A mesh room sends one packet per recipient, so a single message from a
+# member of a full room is already 7 packets. This is a flood ceiling, not a
+# pacing mechanism.
+PACKETS_PER_SOCKET = int(os.environ.get("SPECTRE_PACKET_RATE", "240"))
+PACKET_WINDOW_SECONDS = 10
+
 logging.basicConfig(
     level=os.environ.get("SPECTRE_LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)-7s %(message)s",
@@ -96,6 +115,66 @@ _room_locks_guard = threading.Lock()
 def room_lock(room: str) -> threading.Lock:
     with _room_locks_guard:
         return _room_locks.setdefault(room, threading.Lock())
+
+
+class RateLimiter:
+    """
+    Token bucket per key, with a ceiling on how many keys are tracked.
+
+    The bound matters as much as the limiting does: the keys are attacker-
+    chosen (a username, a socket id), so an unbounded table would just move
+    the exhaustion from the backend into the relay. The least recently
+    refilled bucket is evicted, which is the one closest to full anyway.
+    """
+
+    def __init__(self, limit: int, window: float, max_keys: int = 4096):
+        self.limit = float(limit)
+        self.window = float(window)
+        self.max_keys = max_keys
+        self._buckets = {}
+        self._guard = threading.Lock()
+
+    def allow(self, key) -> bool:
+        if key is None:
+            return True
+        now = time.monotonic()
+        with self._guard:
+            tokens, last = self._buckets.get(key, (self.limit, now))
+            tokens = min(self.limit, tokens + (now - last) * self.limit / self.window)
+            if tokens < 1.0:
+                self._buckets[key] = (tokens, now)
+                return False
+            self._buckets[key] = (tokens - 1.0, now)
+            if len(self._buckets) > self.max_keys:
+                oldest = min(self._buckets, key=lambda k: self._buckets[k][1])
+                self._buckets.pop(oldest, None)
+            return True
+
+    def forget(self, key) -> None:
+        with self._guard:
+            self._buckets.pop(key, None)
+
+
+auth_limit_by_user = RateLimiter(AUTH_ATTEMPTS_PER_USER, AUTH_WINDOW_SECONDS)
+auth_limit_by_socket = RateLimiter(AUTH_ATTEMPTS_PER_SOCKET, AUTH_WINDOW_SECONDS)
+packet_limit = RateLimiter(PACKETS_PER_SOCKET, PACKET_WINDOW_SECONDS)
+
+
+def _auth_allowed(user: str, event: str) -> bool:
+    """
+    True if this attempt may go to the backend.
+
+    Both buckets are consumed on every attempt: the per-user one stops a
+    single account being ground down from many sockets, the per-socket one
+    stops a single socket enumerating many accounts.
+    """
+    ok_user = auth_limit_by_user.allow(user)
+    ok_socket = auth_limit_by_socket.allow(request.sid)
+    if ok_user and ok_socket:
+        return True
+    # The username is logged; the verifier never is.
+    log.warning("rate limited %s for %r", event, user)
+    return False
 
 
 # ============================================================
@@ -213,6 +292,8 @@ def handle_disconnect():
         if not members:
             rooms.pop(room, None)
 
+    auth_limit_by_socket.forget(sid)
+    packet_limit.forget(sid)
     log.info("socket disconnected: %s", sid)
 
 
@@ -230,6 +311,11 @@ def handle_register(data):
     if not user or not verifier:
         emit("register_result", {"success": False, "code": "INVALID_REQUEST",
                                  "message": "user and verifier are required"})
+        return
+
+    if not _auth_allowed(user, "register"):
+        emit("register_result", {"success": False, "code": "RATE_LIMITED",
+                                 "message": "Too many attempts. Wait a few minutes."})
         return
 
     try:
@@ -262,6 +348,11 @@ def handle_login(data):
                               "message": "user and verifier are required"})
         return
 
+    if not _auth_allowed(user, "login"):
+        emit("login_result", {"success": False, "code": "RATE_LIMITED",
+                              "message": "Too many attempts. Wait a few minutes."})
+        return
+
     try:
         resp = backend_post("/internal/auth/login", {
             "username": user,
@@ -288,6 +379,9 @@ def handle_login(data):
         "role": resp.get("role"),
         "room": None,
     }
+    # A correct password is not an attack, so it does not leave the account
+    # half-locked for whoever signs in next.
+    auth_limit_by_user.forget(user)
     log.info("login ok: %s", user)
     emit("login_result", {"success": True, "code": "OK", "message": "OK"})
 
@@ -451,6 +545,10 @@ def handle_packet(data):
 
     data = data or {}
     if data.get("type") != "msg":
+        return
+
+    if not packet_limit.allow(request.sid):
+        emit("error_msg", {"message": "Sending too fast."})
         return
 
     room = data.get("room")

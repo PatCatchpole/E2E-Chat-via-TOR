@@ -269,3 +269,39 @@ def test_repeated_forged_packets_do_not_degrade_the_session():
             b.decrypt(forged)
 
     assert recv(b, send(a, "unharmed")) == "unharmed"
+
+
+def test_retired_dh_keys_do_not_grow_without_bound():
+    """
+    One entry is added per DH rotation. Unbounded, a long conversation
+    serialises hundreds of kilobytes of dead keys on every message save.
+    """
+    from crypto.ratchet import MAX_RETIRED_DH
+
+    alice, bob = make_session()
+    alice_to_bob = alice.encrypt(b"opening")
+    bob.decrypt(alice_to_bob)
+
+    for i in range(MAX_RETIRED_DH + 40):
+        # Alternating direction forces a DH rotation each way.
+        bob.decrypt(alice.encrypt(f"a{i}".encode()))
+        alice.decrypt(bob.encrypt(f"b{i}".encode()))
+
+    assert len(bob.retired_dh) <= MAX_RETIRED_DH
+    assert len(alice.retired_dh) <= MAX_RETIRED_DH
+    # Still usable after all that eviction.
+    assert bob.decrypt(alice.encrypt(b"still here")) == b"still here"
+
+
+def test_retired_dh_survives_save_and_restore_with_its_order():
+    from crypto.state import restore_ratchet, snapshot_ratchet
+
+    alice, bob = make_session()
+    bob.decrypt(alice.encrypt(b"one"))
+    alice.decrypt(bob.encrypt(b"two"))
+    bob.decrypt(alice.encrypt(b"three"))
+
+    restored = restore_ratchet(snapshot_ratchet(bob))
+
+    assert list(restored.retired_dh) == list(bob.retired_dh)
+    assert restored.decrypt(alice.encrypt(b"after restart")) == b"after restart"

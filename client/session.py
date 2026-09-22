@@ -14,6 +14,7 @@ Deliberately free of user-interface code -- everything is reported through an
 from __future__ import annotations
 
 import base64
+import os
 import threading
 import time
 
@@ -29,8 +30,38 @@ from crypto.state import restore_ratchet, snapshot_ratchet
 from crypto.x3dh import x3dh_initiator, x3dh_responder
 import storage
 
-TOR_SOCKS_PORT = 9150  # Tor Browser. A standalone tor daemon uses 9050.
+# A standalone `tor` daemon listens on 9050, Tor Browser on 9150. The README
+# used to say "change this constant", which meant editing a source file to run
+# against the daemon and left the edit sitting in everyone's working tree.
+#
+# The daemon is tried first, and the ports are *connected* to rather than
+# probed for a listener: Tor Browser starts its tor with `DisableNetwork 1`
+# and only lifts it once you click Connect, so an idle Tor Browser holds 9150
+# open while routing nothing. A socket probe cannot tell that apart from a
+# working proxy -- only an attempt to use it can.
+TOR_SOCKS_PORT = int(os.environ.get("SPECTRE_TOR_SOCKS_PORT", "0")) or None
+TOR_SOCKS_CANDIDATES = (9050, 9150)
+
 REQUEST_TIMEOUT = 30
+
+# An onion circuit is built on the first request, which routinely takes longer
+# than engineio's 5 second default -- and it fails as a bare ConnectTimeout
+# that reads like the relay being down.
+TOR_REQUEST_TIMEOUT = 60
+
+
+def tor_socks_ports() -> tuple:
+    """The SOCKS ports to try, in order. An explicit setting wins outright."""
+    return (TOR_SOCKS_PORT,) if TOR_SOCKS_PORT else TOR_SOCKS_CANDIDATES
+
+# Packets that arrive before the sender's bundle are held until the handshake
+# completes. Both bounds exist because neither the count of senders nor the
+# count of packets is ours to control: the relay chooses what to deliver and
+# what name to put on it, so an unbounded queue is a remote memory exhaustion.
+# The oldest are dropped -- the ratchet's skipped-key window already covers
+# genuine early arrivals, and a peer whose bundle never lands is not a peer.
+MAX_PENDING_PER_PEER = 64
+MAX_PENDING_PEERS = 32
 
 
 class SessionError(Exception):
@@ -113,7 +144,8 @@ class SpectreSession:
         self._register_event = threading.Event()
         self._register_result = {}
 
-        self.sio = self._build_client()
+        self.tor_socks_port = None
+        self.sio = self._build_client(socks_port=tor_socks_ports()[0])
         self._wire_handlers()
         self._restore_sessions()
 
@@ -132,17 +164,18 @@ class SpectreSession:
         storage.save_identity_seed(self.user, identity.export_seed())
         return identity
 
-    def _build_client(self):
+    def _build_client(self, socks_port=None):
         if not self.use_tor:
             return socketio.Client(reconnection=True, reconnection_attempts=0)
 
         http_session = requests.Session()
-        proxy = f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}"
+        proxy = f"socks5h://127.0.0.1:{socks_port}"
         # socks5h keeps hostname resolution inside Tor; plain socks5 would leak
         # the .onion lookup to the local resolver.
         http_session.proxies = {"http": proxy, "https": proxy}
         return socketio.Client(
-            http_session=http_session, reconnection=True, reconnection_attempts=0
+            http_session=http_session, reconnection=True, reconnection_attempts=0,
+            request_timeout=TOR_REQUEST_TIMEOUT,
         )
 
     def _restore_sessions(self):
@@ -329,6 +362,21 @@ class SpectreSession:
         self._flush_outbox()
         self._emit("state")
 
+    def _queue_pending(self, sender: str, packet: dict) -> None:
+        """Hold a packet from a peer we have not handshaked with yet, within bounds."""
+        queue = self._pending.get(sender)
+        if queue is None:
+            if len(self._pending) >= MAX_PENDING_PEERS:
+                # Evict the least recently created queue rather than refusing
+                # the new one: the peer we are mid-handshake with is the one
+                # whose packets we are most likely to need.
+                self._pending.pop(next(iter(self._pending)))
+            queue = self._pending.setdefault(sender, [])
+
+        queue.append(packet)
+        if len(queue) > MAX_PENDING_PER_PEER:
+            del queue[:-MAX_PENDING_PER_PEER]
+
     def _drain_pending(self, peer_user: str):
         queued = self._pending.pop(peer_user, [])
         for packet in queued:
@@ -345,24 +393,34 @@ class SpectreSession:
             return
 
         message_id = data.get("id")
-        if isinstance(message_id, int) and message_id <= self._last_message_id:
-            # Already processed in an earlier run; re-feeding it to the ratchet
-            # would be rejected as a stale replay and log a spurious error.
-            self._ack(message_id)
-            return
+
+        # Backend message ids are NOT a dependable global sequence: the
+        # in-memory backend restarts them at 1 on every launch, so a watermark
+        # persisted from an earlier run can sit above ids that are genuinely
+        # new. Dropping on that comparison silently discarded real messages --
+        # no error, no log, the text simply never appeared.
+        #
+        # The ratchet is the authority on what is a replay, and it already
+        # rejects duplicates atomically. So the watermark is only a hint now:
+        # it decides whether a rejection is worth reporting, never whether the
+        # packet is handed to the ratchet.
+        probably_seen = isinstance(message_id, int) and message_id <= self._last_message_id
 
         with self._lock:
             peer = self.peers.get(sender)
             if peer is None or peer.ratchet is None:
                 if not queued:
-                    self._pending.setdefault(sender, []).append(data)
+                    self._queue_pending(sender, data)
                 return
 
             try:
                 payload = peer.ratchet.decrypt(data)
             except RatchetError as e:
-                self._emit("error",
-                           text=f"Could not decrypt a message from {sender}: {e}")
+                # A packet we have already consumed is expected noise when the
+                # backend replays a backlog; anything else is worth seeing.
+                if not probably_seen:
+                    self._emit("error",
+                               text=f"Could not decrypt a message from {sender}: {e}")
                 return
             except Exception as e:
                 self._emit("error",
@@ -489,8 +547,37 @@ class SpectreSession:
     # ---- lifecycle ----------------------------------------------------
 
     def connect(self):
-        self.sio.connect(self.url, wait=True, wait_timeout=REQUEST_TIMEOUT,
-                         transports=["polling"])
+        if not self.use_tor:
+            self.sio.connect(self.url, wait=True, wait_timeout=REQUEST_TIMEOUT,
+                             transports=["polling"])
+            return
+
+        # Each candidate is tried by actually connecting through it. A closed
+        # port refuses instantly; a port held open by an idle Tor Browser
+        # costs one timeout and then we move on, which is the whole reason
+        # this is a loop rather than a probe.
+        ports = tor_socks_ports()
+        failures = []
+        for port in ports:
+            self.sio = self._build_client(socks_port=port)
+            self._wire_handlers()
+            try:
+                self.sio.connect(self.url, wait=True,
+                                 wait_timeout=TOR_REQUEST_TIMEOUT,
+                                 transports=["polling"])
+            except Exception as e:
+                failures.append(f"127.0.0.1:{port} ({e.__class__.__name__})")
+                continue
+            self.tor_socks_port = port
+            self._emit("status", text=f"Reached the relay over Tor via SOCKS {port}.")
+            return
+
+        raise SessionError(
+            "could not reach the relay through Tor. Tried " + ", ".join(failures)
+            + ". Start a `tor` daemon or connect Tor Browser (an open Tor "
+              "Browser that has not connected yet holds 9150 but routes "
+              "nothing), or set SPECTRE_TOR_SOCKS_PORT."
+        )
 
     def authenticate(self) -> None:
         """Log in, registering first if the account does not exist yet."""

@@ -12,8 +12,9 @@ This file covers what the README does not: how to work in the repo.
 ```bash
 source .venv/bin/activate                  # Python 3.9 venv already present
 python spectre.py                          # the launcher: starts everything, no setup
-python -m pytest tests/ -q                 # 70 tests, ~1s, all passing
+python -m pytest tests/ -q                 # 102 tests, ~3s, all passing
 cd back-end/spectre-chat && mvn -B compile # Java 25 + Maven are installed and it builds
+cd back-end/spectre-chat && mvn -B test -Dtest=MessageWireFormatTest   # pins the stored-message format
 ```
 
 The manual path, for working on one piece at a time:
@@ -70,6 +71,17 @@ Each of these was a live vulnerability; each has a test that fails if it returns
   forged counter is a DoS.
 - The relay and backend exit rather than default `SPECTRE_INTERNAL_TOKEN`; CORS is
   empty unless configured; ciphertext and the token are never logged.
+- The backend carries `header` and `body` as opaque JSON. They were typed
+  records whose field names did not match the wire, and Jackson dropped the
+  ciphertext on the way into the database. Do not re-introduce a typed DTO —
+  the header is AEAD associated data and must round-trip byte for byte.
+- Storage filenames end in a `_key(...)` digest of the exact components.
+  `_safe_name` is lossy and the parts are joined with `__`, so without it two
+  different pairwise sessions can name one state file.
+- Delivery is never gated on the backend's message id. Ids restart at 1
+  whenever the in-memory backend does; the ratchet is the authority on replay.
+- Sign-in and packets are rate limited per username and per socket, never per
+  IP — behind a hidden service every client is `127.0.0.1`.
 - Local files are 0600 via atomic writes in `storage.py` (POSIX only — Windows has
   no equivalent, and `storage.POSIX_PERMISSIONS` guards the assertions).
 
@@ -87,7 +99,20 @@ Each of these was a live vulnerability; each has a test that fails if it returns
   Old state is discarded with a warning rather than misread.
 - Flask-SocketIO must be ≥5.4 against Flask ≥3.1; pinned in `requirements.txt`.
 - Port 5000 is AirPlay Receiver on macOS — `dev.env` uses 5055.
+- The client tries SOCKS 9050 then 9150 by *connecting*, not by checking for a
+  listener: Tor Browser holds 9150 open with `DisableNetwork 1` until you click
+  Connect, so a probe cannot tell a working proxy from an idle one.
+- `spectre.py --tor` runs its own `tor` under `~/.spectre/tor` on its own
+  SocksPort, so it never fights a system daemon or Tor Browser. The service key
+  there is what keeps the `.onion` address stable — treat it as key material.
 - `dev.env` is gitignored and holds a placeholder token; never commit a real one.
-- Never add key material to the repo. Two private keys are still reachable in git
-  history at `5b3f23f` (README §10.2) — treat them as burned.
+- Never add key material to the repo. Two private keys are still reachable in
+  git history at **both** `crypto/` and `client/crypto/` (they were moved), on
+  a public repo that has a fork — so they are burned permanently, not merely
+  untracked. README §10.2 has the full path list; stripping only one of the two
+  locations leaves the identical blob behind.
 - Work lives on `harden-protocol`; `main` is the old, vulnerable code.
+- Plain `mvn test` fails on `SpectreChatApplicationTests.contextLoads`: it is a
+  `@SpringBootTest` and needs `SPECTRE_DB_PASSWORD` and a live Postgres. That
+  is pre-existing, not a regression — scope to `-Dtest=MessageWireFormatTest`
+  unless a database is actually running.

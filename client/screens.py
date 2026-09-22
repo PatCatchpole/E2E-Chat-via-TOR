@@ -180,13 +180,17 @@ def start_screen(default: str = JOIN, message: str = ""):
 # ------------------------------------------------------- hosting confirmed
 
 
-def host_ready_screen(addresses: list):
+def host_ready_screen(addresses: list, onion: str = None):
     """
     Show where the relay is listening so the address can be read out.
 
-    `addresses` is a list of (label, value) pairs. Returns True to carry on to
-    sign in, or None to quit -- quitting here stops the relay again, so it has
-    to be distinguishable from continuing.
+    `addresses` is a list of (label, value) pairs. `onion`, when the room is
+    published over Tor, gets a line of its own: a v3 address is 62 characters
+    and would be truncated in a labelled column on an 80-wide terminal, which
+    for an address somebody has to copy exactly is worse than useless.
+
+    Returns True to carry on to sign in, or None to quit -- quitting here
+    stops the relay again, so it has to be distinguishable from continuing.
     """
     def submit():
         app.exit(result=True)
@@ -196,6 +200,16 @@ def host_ready_screen(addresses: list):
         rows.append(_labelled(label, Window(
             FormattedTextControl([("class:peer", value)]), height=1,
         ), label_width=12))
+
+    if onion:
+        rows.append(Window(height=1))
+        rows.append(Window(FormattedTextControl([
+            ("class:dim", "Join from anywhere over Tor:")
+        ]), height=1))
+        rows.append(Window(FormattedTextControl([
+            ("class:peer", onion)
+        ]), height=1))
+
     rows.append(Window(height=1))
     rows.append(Window(FormattedTextControl([
         ("class:dim", "Anyone on your network can join with the address above.")

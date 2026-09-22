@@ -75,5 +75,8 @@ def restore_ratchet(data: dict) -> DoubleRatchet:
         (_d(entry["dh"]), entry["n"]): _d(entry["mk"])
         for entry in data.get("skipped", [])
     }
-    ratchet.retired_dh = {_d(key) for key in data.get("retired_dh", [])}
+    # An ordered container, not a set: MAX_RETIRED_DH evicts the oldest. The
+    # serialised shape is unchanged, so state written by an older build still
+    # restores -- it just arrives in whatever order the set happened to hold.
+    ratchet.retired_dh = {_d(key): None for key in data.get("retired_dh", [])}
     return ratchet

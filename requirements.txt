@@ -18,3 +18,8 @@ prompt_toolkit==3.0.52
 
 # bcrypt is deliberately absent: password hashing now happens in the backend.
 # The client derives a PBKDF2 verifier with hashlib from the standard library.
+
+# Desktop window (client/desktop). Optional: without it the launcher falls
+# back to the terminal interface. Not installed on Linux, where it needs
+# system GTK/WebKit packages rather than wheels.
+pywebview==6.2.1; sys_platform == "darwin" or sys_platform == "win32"

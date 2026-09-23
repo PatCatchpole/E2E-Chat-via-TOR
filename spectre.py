@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
-import re
 import runpy
 import secrets
 import signal
@@ -51,10 +50,6 @@ RELAY_SCRIPT = ROOT / "server" / "app.py"
 BACKEND_SCRIPT = ROOT / "tools" / "dev_backend.py"
 SERVICES = {"relay": RELAY_SCRIPT, "backend": BACKEND_SCRIPT}
 
-# What `client_cli.resolve_relay` makes of a v3 onion address. Anything else
-# typed into the join screen is refused, since the launcher only uses Tor.
-ONION_URL = re.compile(r"^http://[a-z2-7]{56}\.onion(:\d+)?$")
-
 # 5000 is AirPlay Receiver on macOS, which answers 403 rather than refusing the
 # connection -- an error that looks like a relay bug. Start above it.
 PREFERRED_RELAY_PORT = 5055
@@ -73,10 +68,12 @@ TOR_BOOTSTRAP_TIMEOUT = 120
 
 # Children must not share our Ctrl-C. POSIX gets that from a new session;
 # Windows delivers Ctrl-C to the whole console process group instead, so the
-# child needs a group of its own. Closing the console window still ends every
-# process attached to it, so nothing is left listening unattended.
+# child needs a group of its own. CREATE_NO_WINDOW because the packaged app is
+# a windowed program with no console: tor.exe is a console program, and without
+# it every launch would flash up a black window of its own.
 if os.name == "nt":
-    DETACHED = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    DETACHED = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+                                 | subprocess.CREATE_NO_WINDOW}
 else:
     DETACHED = {"start_new_session": True}
 
@@ -379,7 +376,12 @@ class TorProcess:
         # accepts forward slashes.
         return '"' + path.as_posix() + '"'
 
-    def start(self) -> None:
+    def start(self, on_bootstrapped=None) -> None:
+        """
+        Start tor and wait until it is usable. `on_bootstrapped`, if given, is
+        called once tor has reached the network -- before the onion service
+        is published, which can take as long again.
+        """
         binary = self.binary()
         if binary is None:
             raise RuntimeError(
@@ -432,15 +434,16 @@ class TorProcess:
         )
         _stop_on_exit(self.stop)
 
-        self._await_bootstrap()
+        self._await_bootstrap(on_bootstrapped)
         if self.publish_port:
             self.hostname = (self.service_dir / "hostname").read_text(encoding="utf-8").strip()
 
-    def _await_bootstrap(self) -> None:
+    def _await_bootstrap(self, on_bootstrapped=None) -> None:
         """Wait for tor to bootstrap (and publish), or explain why it did not."""
         deadline = time.time() + TOR_BOOTSTRAP_TIMEOUT
         hostname_file = self.service_dir / "hostname"
         log_path = self.root / "tor.log"
+        announced = False
 
         while time.time() < deadline:
             if self.process.poll() is not None:
@@ -449,8 +452,12 @@ class TorProcess:
                 log = log_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 log = ""
+            bootstrapped = "Bootstrapped 100%" in log
+            if bootstrapped and not announced and on_bootstrapped is not None:
+                announced = True
+                on_bootstrapped()
             published = hostname_file.exists() or not self.publish_port
-            if published and "Bootstrapped 100%" in log:
+            if published and bootstrapped:
                 return
             time.sleep(1.0)
 
@@ -529,10 +536,11 @@ def _sign_in(screens, storage, client_cli, relay, choice: str):
         if hosting:
             url, use_tor = relay, False
         else:
-            # Onion addresses are base32 and case-insensitive; tor wants lower.
+            # Anything but an onion address is refused: this launcher only
+            # connects through Tor.
             relay = credentials["relay"].strip().lower()
-            url, use_tor = client_cli.resolve_relay(relay)
-            if not use_tor or not ONION_URL.match(url):
+            url, use_tor = client_cli.onion_url(relay), True
+            if url is None:
                 message = ("That is not an onion address. Paste the 56-character "
                            ".onion address your host sent you.")
                 continue
@@ -560,6 +568,10 @@ def _parse_args():
     # Everything goes through Tor now, so there is nothing left to switch on.
     # Accepted and ignored so existing shortcuts keep working.
     parser.add_argument("--tor", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--terminal", action="store_true",
+        help="use the full-screen terminal interface instead of the desktop window",
+    )
     # Internal: how a frozen build runs its own relay and backend.
     parser.add_argument("--serve", choices=sorted(SERVICES), help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -567,6 +579,16 @@ def _parse_args():
 
 def _serve(name: str) -> None:
     """Run the relay or backend in this process, as its own script would."""
+    # A windowed PyInstaller build starts with no sys.stdout or sys.stderr at
+    # all, and Werkzeug and logging both write to them. The handles
+    # LocalRelay passed in point at the log file, so reattach those.
+    for stream, descriptor in (("stdout", 1), ("stderr", 2)):
+        if getattr(sys, stream) is None:
+            try:
+                setattr(sys, stream, os.fdopen(descriptor, "w", buffering=1,
+                                               encoding="utf-8", errors="replace"))
+            except OSError:
+                setattr(sys, stream, open(os.devnull, "w", encoding="utf-8"))
     script = SERVICES[name]
     sys.path.insert(0, str(script.parent))
     sys.argv = [str(script)]
@@ -580,7 +602,7 @@ def _start_screen_default(screens, prefs: dict) -> str:
     return screens.JOIN
 
 
-def _tor_for_joining(session_module):
+def _tor_for_joining(session_module, say=print):
     """
     Start our own tor to reach an onion relay, or None to fall back.
 
@@ -592,15 +614,64 @@ def _tor_for_joining(session_module):
     if session_module.TOR_SOCKS_PORT or TorProcess.binary() is None:
         return None
     tor = TorProcess()
-    print("Connecting to the Tor network (the first time can take a minute) ...")
+    say("Connecting to the Tor network (the first time can take a minute) ...")
     try:
         tor.start()
     except RuntimeError as error:
-        print(f"\nCould not start tor: {error}\n"
-              f"Trying a tor that is already running instead.\n")
+        say(f"\nCould not start tor: {error}\n"
+            f"Trying a tor that is already running instead.\n")
         return None
     session_module.TOR_SOCKS_PORT = tor.socks_port
     return tor
+
+
+def _desktop_available() -> bool:
+    try:
+        import webview  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _run_desktop(storage, session_module) -> None:
+    """
+    The desktop window. Same flow as the terminal screens below -- host or
+    join, sign in, pick a room -- but driven by the page in client/desktop.
+    This function owns the child processes; the window only asks for them.
+    """
+    from desktop import app as desktop
+
+    children = {}
+
+    def host(progress):
+        relay = LocalRelay(_relay_token())
+        relay.start()
+        children["relay"] = relay
+        progress("relay")
+
+        # Publishing is the only way in: the relay listens on loopback.
+        tor = TorProcess(publish_port=relay.relay_port)
+        try:
+            tor.start(on_bootstrapped=lambda: progress("tor"))
+        except RuntimeError:
+            children.pop("relay").stop()
+            raise
+        children["tor"] = tor
+        progress("published", onion=tor.hostname)
+        return relay.local_url
+
+    def client_tor():
+        tor = _tor_for_joining(session_module, say=lambda _text: None)
+        if tor is not None:
+            children["client_tor"] = tor
+
+    try:
+        desktop.run(desktop.Launcher(host, client_tor, storage.load_launcher_prefs()))
+    finally:
+        for name in ("client_tor", "tor", "relay"):
+            child = children.pop(name, None)
+            if child is not None:
+                child.stop()
 
 
 def main() -> None:
@@ -617,6 +688,10 @@ def main() -> None:
     import storage
 
     storage.ensure_dirs()
+
+    if not args.terminal and _desktop_available():
+        _run_desktop(storage, session_module)
+        return
 
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         sys.exit(

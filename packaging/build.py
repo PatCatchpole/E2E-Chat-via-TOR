@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Build the one-file Spectre executable for the platform this runs on.
+Build the packaged Spectre app for the platform this runs on.
 
-    pip install -r requirements.txt pyinstaller
+    pip install -r requirements-build.txt
     python packaging/build.py
 
-The result is `dist/Spectre` (`dist/Spectre.exe` on Windows): Python, every
-dependency, the relay, the in-memory backend and a tor binary in one file, so
-the person running it installs nothing. PyInstaller cannot cross-compile --
+The result carries Python, every dependency, the relay, the in-memory backend
+and a tor binary, so the person running it installs nothing:
+
+    macOS    dist/Spectre.app (and Spectre.app.zip)  desktop window
+    Windows  dist/Spectre.exe                         desktop window
+    Linux    dist/Spectre                             terminal interface
+ PyInstaller cannot cross-compile --
 a Windows build has to be made on Windows -- which is what
 `.github/workflows/build.yml` is for.
 
@@ -121,6 +125,9 @@ def unpack_tor(data: bytes) -> None:
 
 
 def build() -> None:
+    # A one-file build leaves dist/Spectre as a file and the .app build wants
+    # dist/Spectre as a directory; start clean rather than collide.
+    shutil.rmtree(ROOT / "dist", ignore_errors=True)
     subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
          "--distpath", str(ROOT / "dist"), "--workpath", str(ROOT / "build" / "pyinstaller"),
@@ -129,13 +136,31 @@ def build() -> None:
     )
 
 
+def package_app() -> Path:
+    """
+    Zip Spectre.app for download. `ditto` rather than zipfile: it keeps the
+    symlinks and extended attributes inside the bundle that its signature
+    covers, and a bundle zipped any other way arrives "damaged".
+    """
+    app = ROOT / "dist" / "Spectre.app"
+    archive = ROOT / "dist" / "Spectre.app.zip"
+    archive.unlink(missing_ok=True)
+    subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent",
+                    str(app), str(archive)], check=True)
+    return archive
+
+
 def main() -> None:
     key = target()
     print(f"building Spectre for {key}")
     unpack_tor(fetch_tor(key))
     build()
-    name = "Spectre.exe" if sys.platform == "win32" else "Spectre"
-    print(f"\nbuilt {ROOT / 'dist' / name}")
+    dist = ROOT / "dist"
+    if (dist / "Spectre.app").is_dir():
+        print(f"\nbuilt {dist / 'Spectre.app'}\nzipped {package_app()}")
+    else:
+        name = "Spectre.exe" if sys.platform == "win32" else "Spectre"
+        print(f"\nbuilt {dist / name}")
 
 
 if __name__ == "__main__":

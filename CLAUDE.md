@@ -11,8 +11,9 @@ This file covers what the README does not: how to work in the repo.
 
 ```bash
 source .venv/bin/activate                  # Python 3.9 venv already present
-python spectre.py                          # the launcher: starts everything, no setup
-python -m pytest tests/ -q                 # 102 tests, ~3s, all passing
+python spectre.py                          # the launcher: desktop window, starts everything
+python spectre.py --terminal               # same flow in the full-screen terminal UI
+python -m pytest tests/ -q                 # 125 tests, ~3s, all passing
 cd back-end/spectre-chat && mvn -B compile # Java 25 + Maven are installed and it builds
 cd back-end/spectre-chat && mvn -B test -Dtest=MessageWireFormatTest   # pins the stored-message format
 python packaging/build.py                  # one-file dist/Spectre with tor inside (pyinstaller is in the venv)
@@ -48,6 +49,20 @@ anything that is not specifically about the Java code.
   not here.
 - `SpectreSession` has no UI code. Everything reaches the terminal through the
   `on_event(kind, payload)` callback, which is what lets tests drive it.
+- Two front ends drive that one session: `ui.py` (terminal) and
+  `client/desktop/` (pywebview window). The window's page is a view only: keys
+  and plaintext stay in Python, and `desktop/app.py`'s `Bridge` is the entire
+  surface the page can call. Its public methods are exposed to JavaScript by
+  pywebview, so anything not meant for the page must be underscored.
+- In the window's page, text from other people (names, rooms, messages) is
+  placed with `textContent` only -- never `innerHTML`. The page can call the
+  session, so markup from the network would be code from the network.
+  `tests/test_desktop.py` fails on any HTML sink in `app.js`.
+- The page is inlined into one document (fonts as data URIs) under a CSP with
+  `default-src 'none'`: it must never fetch anything, since that would leave
+  the machine outside Tor. `'unsafe-eval'` is there only because pywebview
+  builds its API stubs with `new Function`. Push events with `run_js` (native,
+  CSP-exempt); `evaluate_js` wraps the code in `eval` and is blocked.
 - Module docstrings explain the defect the module replaces, not just what it
   does. That history is deliberate — this project is a rewrite of code with real
   vulnerabilities, and the docstrings are what stops them being reintroduced.

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="{{CSP}}">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spectre</title>
+<style>/*{{CSS}}*/</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <b class="brand">SPEC<span>TRE</span></b>
+    <span class="grow"></span>
+    <span class="pill" id="state-pill"><span class="led"></span><span id="state-text">Not connected</span></span>
+  </header>
+
+  <!-- START -->
+  <section class="screen" id="s-start">
+    <div class="center"><div class="panel">
+      <h1 class="wordmark">SPEC<span>TRE</span></h1>
+      <p class="lede">End-to-end encrypted group chat over Tor. Every message is sealed once for each person in the room, so only they can read it.</p>
+      <button class="choice host" type="button" id="pick-host">
+        <span class="tag">H</span><strong>Host a room</strong>
+        <small>Publish it on Tor and send the .onion address to the people you want in.</small>
+      </button>
+      <button class="choice join" type="button" id="pick-join">
+        <span class="tag">J</span><strong>Join a room</strong>
+        <small>Paste the .onion address your host sent you.</small>
+      </button>
+      <div class="error" id="start-error" hidden></div>
+    </div></div>
+  </section>
+
+  <!-- HOSTING -->
+  <section class="screen" id="s-hosting" hidden>
+    <div class="center"><div class="panel">
+      <div class="card">
+        <h2 id="host-title">Publishing your room on Tor</h2>
+        <div class="bar" aria-hidden="true"><i id="host-bar"></i></div>
+        <ul class="steps" id="host-steps"></ul>
+        <div class="error" id="host-error" hidden></div>
+        <div id="host-ready" class="stack" hidden>
+          <span class="label">Send this to your friends</span>
+          <div class="onion" id="onion-out"></div>
+          <div class="row">
+            <button class="btn" type="button" id="copy-onion">Copy address</button>
+            <button class="btn ghost" type="button" id="host-continue">Continue to sign in</button>
+          </div>
+          <p class="hint" id="copy-note" aria-live="polite">The address isn't secret, just impossible to guess. Anyone who has it can reach the sign-in screen.</p>
+        </div>
+        <div class="row" id="host-back" hidden><button class="btn ghost" type="button" data-go="start">Back</button></div>
+      </div>
+      <div class="warnbar"><span class="mark">!</span><span>Accounts and history live in memory only. Closing this window ends the room.</span></div>
+    </div></div>
+  </section>
+
+  <!-- SIGN IN -->
+  <section class="screen" id="s-signin" hidden>
+    <div class="center"><div class="panel">
+      <h1 class="wordmark small">Sign in</h1>
+      <form class="card" id="signin-form" novalidate autocomplete="off">
+        <label class="field" for="onion" id="onion-field">Onion address
+          <input class="mono" id="onion" spellcheck="false" autocapitalize="off">
+          <span class="hint">56 letters and digits ending in .onion, exactly as your host sent it.</span>
+        </label>
+        <label class="field" for="user">Username
+          <input id="user" spellcheck="false" autocapitalize="off">
+        </label>
+        <label class="field" for="pass">Password
+          <input id="pass" type="password">
+          <span class="hint">New name? An account is created for you.</span>
+        </label>
+        <div class="error" id="signin-error" hidden></div>
+        <div class="row">
+          <button class="btn" type="submit" id="signin-submit">Sign in</button>
+          <button class="btn ghost" type="button" id="signin-back">Back</button>
+        </div>
+      </form>
+    </div></div>
+  </section>
+
+  <!-- ROOMS -->
+  <section class="screen" id="s-rooms" hidden>
+    <div class="center"><div class="panel">
+      <h1 class="wordmark small">Pick a room</h1>
+      <div class="rooms" id="room-list"></div>
+      <form class="stack" id="room-form" novalidate autocomplete="off">
+        <label class="field" for="new-room">New room
+          <input id="new-room" spellcheck="false" autocapitalize="off">
+          <span class="hint">Everyone who wants to talk types the same room name.</span>
+        </label>
+        <div class="error" id="room-error" hidden></div>
+        <div class="row">
+          <button class="btn" type="submit">Enter room</button>
+          <button class="btn ghost" type="button" data-go="signin">Back</button>
+        </div>
+      </form>
+    </div></div>
+  </section>
+
+  <!-- CONNECTING -->
+  <section class="screen" id="s-connecting" hidden>
+    <div class="center"><div class="panel">
+      <div class="card">
+        <h2 id="connect-title"></h2>
+        <div class="bar busy" aria-hidden="true"><i></i></div>
+        <ul class="log" id="connect-log" aria-live="polite"></ul>
+      </div>
+    </div></div>
+  </section>
+
+  <!-- CHAT -->
+  <section class="screen" id="s-chat" hidden>
+    <div class="chat">
+      <aside class="side">
+        <header>
+          <h2><small>Room</small><span id="room-name"></span></h2>
+          <span class="pill violet" id="seats"></span>
+        </header>
+        <div class="members" id="members"></div>
+        <footer>
+          <span>Signed in as <b id="me-name"></b></span>
+          <span>Click a person to compare safety numbers.</span>
+          <button class="btn ghost small" type="button" id="leave">Leave room</button>
+        </footer>
+      </aside>
+      <div class="main">
+        <div class="status">
+          <span class="pill" id="tor-chip"><span class="led"></span><span id="tor-chip-text"></span></span>
+          <span class="pill" id="sessions-chip"></span>
+          <span class="pill" id="verify-chip" hidden></span>
+        </div>
+        <div class="feed" id="feed" aria-live="polite"></div>
+        <form class="composer" id="composer" autocomplete="off">
+          <input id="msg" aria-label="Message" maxlength="4000">
+          <button class="btn" type="submit">Send</button>
+        </form>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="scrim" id="scrim" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
+    <header id="dlg-head"><span id="dlg-title"></span><button class="x" type="button" id="dlg-close" aria-label="Close">×</button></header>
+    <div class="body">
+      <p id="dlg-text"></p>
+      <div class="digits" id="digits"></div>
+      <div class="row">
+        <button class="btn" type="button" id="dlg-confirm"></button>
+        <button class="btn ghost" type="button" id="dlg-cancel">Not now</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>/*{{JS}}*/</script>
+</body>
+</html>

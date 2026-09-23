@@ -21,16 +21,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # binary: what the smoke test runs. package: what gets uploaded.
           - os: windows-latest
             artifact: Spectre-windows-x86_64.exe
             binary: dist/Spectre.exe
+            package: dist/Spectre.exe
           - os: macos-latest
-            artifact: Spectre-macos-arm64
-            binary: dist/Spectre
+            artifact: Spectre-macos-arm64.zip
+            binary: dist/Spectre.app/Contents/MacOS/Spectre
+            package: dist/Spectre.app.zip
           # The oldest supported Ubuntu, so the binary runs on older glibc too.
+          # Terminal interface only; see packaging/spectre.spec.
           - os: ubuntu-22.04
             artifact: Spectre-linux-x86_64
             binary: dist/Spectre
+            package: dist/Spectre
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -81,7 +86,7 @@ jobs:
           exit 1
 
       - name: Rename
-        run: mv "${{ matrix.binary }}" "dist/${{ matrix.artifact }}"
+        run: mv "${{ matrix.package }}" "dist/${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
         with:

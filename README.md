@@ -24,24 +24,24 @@ repository's GitHub Releases (or the latest `build` workflow run) and
 double-click it. Python, every dependency and Tor are inside; there is nothing
 to install.
 
-| System  | File                         |
-|---------|------------------------------|
-| Windows | `Spectre-windows-x86_64.exe` |
-| macOS   | `Spectre-macos-arm64`        |
-| Linux   | `Spectre-linux-x86_64`       |
+| System  | File                         | Opens as                          |
+|---------|------------------------------|-----------------------------------|
+| Windows | `Spectre-windows-x86_64.exe` | a desktop window                  |
+| macOS   | `Spectre-macos-arm64.zip`    | `Spectre.app`, a desktop window   |
+| Linux   | `Spectre-linux-x86_64`       | the full-screen terminal interface |
 
-Choose **Host a room on Tor**, send the `.onion` address it
-shows to your friends, and sign in. They choose **Join**, paste the address
-into the onion address field, and sign in too. Joining starts the app's own Tor in the
-background, so nobody needs Tor Browser open.
+Choose **Host a room**, send the `.onion` address it shows to your friends
+(**Copy address** puts it on the clipboard), and sign in. They choose **Join a
+room**, paste the address, and sign in too. Joining starts the app's own Tor in
+the background, so nobody needs Tor Browser open. Click anyone in the member
+list to compare safety numbers.
 
 The builds are not signed with a paid developer certificate, so the first launch
 needs one extra click:
 
-- **macOS** — "cannot be opened because Apple cannot verify it": right-click the
-  file, choose **Open**, then **Open** again (on macOS 15, allow it under
-  System Settings → Privacy & Security → **Open Anyway**). A file downloaded by
-  a browser may also need `chmod +x Spectre-macos-arm64` once.
+- **macOS** — unzip, then "cannot be opened because Apple cannot verify it":
+  right-click `Spectre.app`, choose **Open**, then **Open** again (on macOS 15,
+  allow it under System Settings → Privacy & Security → **Open Anyway**).
 - **Windows** — SmartScreen: **More info** → **Run anyway**.
 - **Linux** — `chmod +x Spectre-linux-x86_64` and run it from a terminal;
   most file managers do not open a terminal for it.
@@ -51,8 +51,12 @@ To build it yourself, see §4.1.
 **From source.** Nothing to configure, and no second terminal:
 
 ```bash
-python spectre.py
+python spectre.py              # desktop window (macOS, Windows)
+python spectre.py --terminal   # full-screen terminal interface
 ```
+
+The window needs `pywebview`, which `requirements.txt` installs on macOS and
+Windows; without it the launcher falls back to the terminal interface.
 
 On macOS you can also double-click **Spectre.command** in Finder.
 
@@ -100,7 +104,9 @@ packaging/
 .github/workflows/    builds the executable for Windows, macOS and Linux
 client/
   client_cli.py       client entry point, argument and prompt handling
-  screens.py          start, sign-in and room-picker screens
+  desktop/app.py      desktop window: pywebview bridge to the session
+  desktop/web/        the window's page, stylesheet, script and bundled fonts (OFL)
+  screens.py          start, sign-in and room-picker screens (terminal)
   session.py          transport, handshake, message dispatch
   ui.py               full-screen terminal chat interface
   storage.py          0600 local persistence for keys and ratchet state
@@ -245,8 +251,17 @@ and nothing more.
 
 ```bash
 pip install -r requirements-build.txt
-python packaging/build.py            # -> dist/Spectre, or dist\Spectre.exe
+python packaging/build.py
 ```
+
+| Built on | Result                                   | Interface       |
+|----------|------------------------------------------|-----------------|
+| macOS    | `dist/Spectre.app`, `dist/Spectre.app.zip` | desktop window  |
+| Windows  | `dist\Spectre.exe` (windowed, no console) | desktop window  |
+| Linux    | `dist/Spectre`                            | terminal        |
+
+Linux stays on the terminal interface because a webview there needs the
+system's GTK and WebKit libraries, which do not bundle sensibly.
 
 This builds for the system it runs on; PyInstaller cannot cross-compile. The
 `build` GitHub Actions workflow runs it on Windows, macOS and Linux, smoke-tests

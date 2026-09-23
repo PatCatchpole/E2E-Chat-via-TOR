@@ -664,6 +664,11 @@ class SpectreSession:
     # ---- views --------------------------------------------------------
 
     @property
+    def joined(self) -> bool:
+        """True once the relay has confirmed we are in the room."""
+        return self._joined
+
+    @property
     def ready(self) -> bool:
         return any(p.ratchet is not None for p in self.peers.values())
 

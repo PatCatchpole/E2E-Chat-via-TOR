@@ -9,7 +9,10 @@ and pipes want.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import os
+import re
 import sys
 from getpass import getpass
 
@@ -93,6 +96,47 @@ def resolve_relay(text: str):
     if text.startswith("http://") or text.startswith("https://"):
         return text.rstrip("/"), False
     return f"http://{text}", False
+
+
+# What `resolve_relay` makes of a v3 onion address: 56 base32 characters.
+ONION_URL = re.compile(r"^http://[a-z2-7]{56}\.onion(:\d+)?$")
+
+
+def onion_address_valid(host: str) -> bool:
+    """
+    True if `host` is a well-formed v3 onion address, checksum included.
+
+    A v3 address is base32(public key || checksum || version), with the
+    checksum a truncated SHA3-256 over the key. Checking it catches a mistyped
+    or truncated address here, rather than after tor has spent a minute
+    failing to find a service that was never there.
+    """
+    label = host[:-len(".onion")] if host.endswith(".onion") else host
+    if len(label) != 56:
+        return False
+    try:
+        raw = base64.b32decode(label.upper())
+    except (ValueError, TypeError):
+        return False
+    key, checksum, version = raw[:32], raw[32:34], raw[34:]
+    if version != b"\x03":
+        return False
+    expected = hashlib.sha3_256(b".onion checksum" + key + version).digest()[:2]
+    return checksum == expected
+
+
+def onion_url(text: str):
+    """
+    The relay URL for a v3 onion address, or None for anything else.
+
+    Onion addresses are base32 and case-insensitive, so the input is folded
+    to lower case first; tor itself wants lower case.
+    """
+    url, use_tor = resolve_relay((text or "").strip().lower())
+    if not use_tor or not ONION_URL.match(url):
+        return None
+    host = url[len("http://"):].rsplit(":", 1)[0]
+    return url if onion_address_valid(host) else None
 
 
 def classic_details(args):

@@ -408,20 +408,23 @@ def handle_join(data):
 
     members = room_members(room)
 
-    # Capacity is checked against other sockets, so a reconnecting client can
-    # replace its own stale entry rather than being locked out of its own room.
+    # A connection that dropped -- routine over Tor -- stays listed until its
+    # ping times out, which can be most of a minute. The client reconnects
+    # and signs in again well before that, and used to be refused here as
+    # "already connected", leaving it outside its own room with every
+    # message it sent queued. Having just proved the password, the new
+    # connection takes the seat over instead; there is still only ever one
+    # socket per name in a room.
     others = {sid: info for sid, info in members.items() if sid != request.sid}
+    stale = [sid for sid, info in others.items() if info["user"] == user]
+    for sid in stale:
+        del others[sid]
+
     if len(others) >= ROOM_CAPACITY:
         emit("error_msg", {
             "message": f"Room '{room}' already has {ROOM_CAPACITY} participants."
         })
         log.info("rejected %s from full room %s", user, room)
-        return
-
-    if any(info["user"] == user for info in others.values()):
-        emit("error_msg", {
-            "message": f"'{user}' is already connected to '{room}' from another session."
-        })
         return
 
     try:
@@ -432,6 +435,18 @@ def handle_join(data):
         log.warning("join failed for %s in %s: %s", user, room, e)
         emit("error_msg", {"message": f"Could not join room: {e}"})
         return
+
+    for sid in stale:
+        # Out of the room and signed out, so the old socket can neither send
+        # nor receive if it turns out to be alive after all. Its eventual
+        # disconnect finds nothing left to clean up and announces nothing.
+        members.pop(sid, None)
+        leave_room(room, sid=sid)
+        sessions.pop(sid, None)
+        socketio.emit("error_msg", {
+            "message": "Signed in again from another connection; this one was closed."
+        }, room=sid)
+        log.info("%s rejoined %s from a new connection", user, room)
 
     join_room(room)
     session["room"] = room

@@ -187,3 +187,51 @@ def test_trusting_an_unflagged_peer_does_nothing():
     session, _ = make_session()
     session._handle_bundle(bundle_of(Identity.generate("bob")))
     assert session.trust_new_identity("bob") is False
+
+
+# ---- reconnecting ------------------------------------------------------
+
+
+def _fire(session, event):
+    session.sio.handlers["/"][event]()
+
+
+def test_a_reconnect_signs_in_and_rejoins_the_room(monkeypatch):
+    # socketio reconnects on its own after a dropped connection, but the
+    # relay treats the new socket as a stranger. Without a fresh sign-in and
+    # join, everything typed afterwards stayed queued for good.
+    import threading
+    session, events = make_session()
+    rejoined = threading.Event()
+    calls = []
+    monkeypatch.setattr(session, "authenticate", lambda: calls.append("authenticate"))
+    monkeypatch.setattr(session.sio, "emit", lambda name, data=None: (
+        calls.append(name), rejoined.set() if name == "join" else None))
+
+    session.join()
+    calls.clear()
+    rejoined.clear()
+    _fire(session, "disconnect")
+    assert session.joined is False
+    _fire(session, "connect")
+
+    assert rejoined.wait(5), "the session never rejoined after reconnecting"
+    assert calls == ["authenticate", "join"]
+
+
+def test_the_first_connect_does_not_rejoin(monkeypatch):
+    session, _ = make_session()
+    monkeypatch.setattr(session, "authenticate",
+                        lambda: pytest.fail("signed in before being asked to"))
+    _fire(session, "connect")
+
+
+def test_leaving_stops_rejoining(monkeypatch):
+    session, _ = make_session()
+    monkeypatch.setattr(session.sio, "emit", lambda *a, **k: None)
+    monkeypatch.setattr(session.sio, "disconnect", lambda *a, **k: None)
+    session.join()
+    session.close()
+    monkeypatch.setattr(session, "authenticate",
+                        lambda: pytest.fail("rejoined a room we had left"))
+    _fire(session, "connect")

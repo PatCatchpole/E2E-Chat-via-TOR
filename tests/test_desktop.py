@@ -158,6 +158,14 @@ def test_only_a_saved_onion_address_is_offered_again():
     assert bridge(prefs={"relay": ONION}).boot()["onion"] == ONION
 
 
+def test_a_room_cannot_be_opened_twice_at_once(monkeypatch):
+    b = bridge("join")
+    b._user = "alice"
+    monkeypatch.setattr(b, "_background", lambda *args: None)   # never finishes opening
+    assert b.enter("spectre")["ok"] is True
+    assert b.enter("spectre")["ok"] is False, "a double-click opened a second session"
+
+
 def test_room_names_must_be_one_short_line():
     b = bridge("join")
     b._user = "alice"

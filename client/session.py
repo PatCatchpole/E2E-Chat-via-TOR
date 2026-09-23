@@ -134,6 +134,9 @@ class SpectreSession:
         self._verifier = derive_verifier(user, password)
         self._identity = self._load_or_create_identity()
         self._joined = False
+        # Set once join() has been asked for and cleared by close(): whether a
+        # reconnect should put us back in the room.
+        self._in_room_wanted = False
         self._lock = threading.RLock()
 
         progress = storage.load_progress(user, room)
@@ -227,14 +230,28 @@ class SpectreSession:
         @sio.event
         def connect():
             self.connected = True
-            self._emit("status", text="Connected to the relay.")
+            if self._in_room_wanted:
+                # socketio reconnects by itself after a dropped connection --
+                # routine over Tor -- but the relay knows nothing about the
+                # new socket: it is not signed in and not in the room. Left
+                # there, every message typed afterwards sat queued forever
+                # while the window looked connected. So sign in and rejoin.
+                # On its own thread: login waits for a reply that arrives on
+                # this one.
+                self._emit("status", text="Reconnected. Rejoining the room.")
+                threading.Thread(target=self._rejoin, daemon=True).start()
+            else:
+                self._emit("status", text="Connected to the relay.")
             self._emit("state")
 
         @sio.event
-        def disconnect():
+        def disconnect(*_reason):
             self.connected = False
             self._joined = False
-            self._emit("status", text="Disconnected from the relay.")
+            if self._in_room_wanted:
+                self._emit("status", text="Connection dropped. Reconnecting.")
+            else:
+                self._emit("status", text="Disconnected from the relay.")
             self._emit("state")
 
         @sio.on("login_result")
@@ -613,7 +630,17 @@ class SpectreSession:
             raise SessionError("the relay did not answer the registration request")
         return self._register_result
 
+    def _rejoin(self):
+        try:
+            self.authenticate()
+            self.join()
+        except SessionError as e:
+            self._emit("error", text=f"Reconnected, but could not sign back in: {e}")
+        except Exception as e:
+            self._emit("error", text=f"Reconnected, but could not rejoin the room: {e}")
+
     def join(self):
+        self._in_room_wanted = True
         self.sio.emit("join", {
             "room": self.room,
             "bundle": self._identity.public_bundle(self.room).to_dict(),
@@ -623,6 +650,7 @@ class SpectreSession:
         threading.Thread(target=self.sio.wait, daemon=True).start()
 
     def close(self):
+        self._in_room_wanted = False
         try:
             self.sio.emit("leave", {"room": self.room})
         except Exception:

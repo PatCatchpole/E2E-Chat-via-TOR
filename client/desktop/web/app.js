@@ -163,8 +163,12 @@
     enter($("new-room").value);
   });
 
+  var entering = false;
   function enter(room) {
+    if (entering) return;                       // a double-click is one click
+    entering = true;
     api.enter(room).then(function (r) {
+      entering = false;
       if (!r.ok) return showError("room-error", r.error);
       state.room = String(room).trim().replace(/^#/, "");
       $("new-room").value = "";
@@ -209,7 +213,7 @@
       if (feed().querySelector('[data-id="' + r.id + '"]')) return;
       var node = bubble(true, state.user, text, null, r.id);
       node.classList.add("queued");
-      node.querySelector(".meta").textContent = "queued · sends when someone can receive it";
+      node.querySelector(".meta").textContent = "waiting · goes out automatically once delivered";
       append(node);
     });
   });
@@ -224,10 +228,13 @@
   function renderSnapshot(s) {
     state.members = s.members;
     $("seats").textContent = (s.members.length + 1) + " of " + s.capacity + " seats";
-    setPill($("tor-chip"), s.connected ? "mint" : "pink",
-            state.mode === "host" ? (s.connected ? "Hosting on Tor" : "Relay offline")
-                                  : (s.connected ? "Tor · connected" : "Tor · reconnecting"));
-    setPill($("state-pill"), s.connected ? "mint" : "pink", "#" + state.room);
+    // Connected is not enough: after a dropped connection the socket comes
+    // back before the session has signed in and rejoined the room.
+    var live = s.connected && s.joined;
+    var link = live ? (state.mode === "host" ? "Hosting on Tor" : "Tor · connected")
+             : s.connected ? "Rejoining room" : "Reconnecting";
+    setPill($("tor-chip"), live ? "mint" : "yellow", link);
+    setPill($("state-pill"), live ? "mint" : "yellow", "#" + state.room);
     $("sessions-chip").textContent = "E2E · " + s.sessions + (s.sessions === 1 ? " session" : " sessions");
 
     var unverified = s.members.filter(function (m) { return !m.verified && !m.changed; }).length;

@@ -205,13 +205,32 @@ def test_a_packet_reaches_only_its_addressee(backend):
     assert events(carol, "packet") == [], "a copy went to the wrong member"
 
 
-def test_a_second_session_under_one_name_is_refused(backend):
-    first, second = connect(), connect()
+def test_a_new_session_under_one_name_replaces_the_old_one(backend):
+    # What a reconnect over Tor looks like: the dropped socket is still listed
+    # when the client signs in again from a new one. Refusing the new socket
+    # left the user outside their own room with every message queued.
+    first, second, bob = connect(), connect(), connect()
     join(first, "alice")
+    join(bob, "bob")
+    first.get_received()
+
     sign_in(second, "alice")
     second.emit("join", {"room": "spectre", "bundle": {}})
+    joined = events(second, "joined")
+    assert joined and joined[0]["members"].count("alice") == 1
 
-    assert events(second, "error_msg")
+    # Still one socket per name: the old one is out of the room and signed out.
+    members = [info["user"] for info in relay.rooms["spectre"].values()]
+    assert members.count("alice") == 1
+    assert events(first, "error_msg"), "the replaced socket was not told"
+
+    bob.get_received()
+    bob.emit("packet", packet(to="alice"))
+    assert len(events(second, "packet")) == 1
+    assert events(first, "packet") == [], "the replaced socket still receives"
+
+    first.emit("packet", packet(to="bob"))
+    assert events(bob, "packet") == [], "the replaced socket can still send"
 
 
 def test_room_capacity_is_enforced(backend, monkeypatch):

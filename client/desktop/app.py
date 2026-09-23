@@ -123,6 +123,7 @@ class Bridge:
         self._user = None
         self._password = None
         self._session = None
+        self._entering = False      # a room is being opened right now
         self._queued = []           # [(id, text)] waiting for a peer to be reachable
         self._next_id = 0
 
@@ -239,6 +240,14 @@ class Bridge:
             return {"ok": False, "error": f"Room names are up to {ROOM_MAX} characters, on one line."}
         if self._user is None:
             return {"ok": False, "error": "Sign in first."}
+        # One room at a time. A double-click used to open two sessions for the
+        # same room, both restoring -- and then both saving -- the same
+        # ratchet state, with the page drawing one and sending through the
+        # other.
+        with self._lock:
+            if self._entering or self._session is not None:
+                return {"ok": False, "error": "Already opening a room."}
+            self._entering = True
         self._background(self._enter, room)
         return {"ok": True}
 
@@ -257,14 +266,19 @@ class Bridge:
             session.start()
             session.authenticate()
         except SessionError as e:
+            with self._lock:
+                self._entering = False
             self._push("enter_failed", {"text": str(e), "back": "signin"})
             return
         except Exception as e:
+            with self._lock:
+                self._entering = False
             self._push("enter_failed", {"text": f"Could not reach the room: {e}", "back": "signin"})
             return
 
         with self._lock:
             self._session = session
+            self._entering = False
             self._queued = []
         session.join()
         self._push("entered", {"room": room, "user": self._user, "mode": self._mode})
@@ -366,6 +380,7 @@ class Bridge:
             "members": members,
             "sessions": sum(1 for p in session.peers.values() if p.ratchet is not None),
             "connected": session.connected,
+            "joined": session.joined,
             "capacity": ROOM_CAPACITY,
         })
 

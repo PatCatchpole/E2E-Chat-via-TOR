@@ -13,7 +13,7 @@ This file covers what the README does not: how to work in the repo.
 source .venv/bin/activate                  # Python 3.9 venv already present
 python spectre.py                          # the launcher: desktop window, starts everything
 python spectre.py --terminal               # same flow in the full-screen terminal UI
-python -m pytest tests/ -q                 # 125 tests, ~3s, all passing
+python -m pytest tests/ -q                 # 129 tests, ~3s, all passing
 cd back-end/spectre-chat && mvn -B compile # Java 25 + Maven are installed and it builds
 cd back-end/spectre-chat && mvn -B test -Dtest=MessageWireFormatTest   # pins the stored-message format
 python packaging/build.py                  # one-file dist/Spectre with tor inside (pyinstaller is in the venv)
@@ -98,6 +98,12 @@ Each of these was a live vulnerability; each has a test that fails if it returns
   whenever the in-memory backend does; the ratchet is the authority on replay.
 - Sign-in and packets are rate limited per username and per socket, never per
   IP — behind a hidden service every client is `127.0.0.1`.
+- A reconnect must rejoin. socketio reconnects by itself after a drop (routine
+  over Tor), but the relay sees a stranger: `SpectreSession` signs in and
+  rejoins from its `connect` handler once `join()` has been called, and the
+  relay lets a re-authenticated user take over their own stale seat instead of
+  refusing it. Without both, the user sat outside the room with every message
+  queued (v1.0.0). One socket per name per room still holds.
 - Local files are 0600 via atomic writes in `storage.py` (POSIX only — Windows has
   no equivalent, and `storage.POSIX_PERMISSIONS` guards the assertions).
 

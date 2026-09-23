@@ -32,6 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -240,6 +241,8 @@ class LocalRelay:
             "SPECTRE_ALLOW_DEV_SERVER": "1",
             "SPECTRE_LOG_LEVEL": "WARNING",
             "PYTHONUNBUFFERED": "1",
+            # Checked by _serve, so the relay and backend exit if we vanish.
+            "SPECTRE_PARENT_PID": str(os.getpid()),
         })
 
         backend = self._spawn(environment, "backend")
@@ -268,12 +271,13 @@ class LocalRelay:
                 os.chmod(path, 0o600)
             except OSError:
                 pass
-        # A frozen build has no interpreter to hand the script to, so it runs
-        # itself again and `--serve` picks the service.
+        # Always through `--serve`, which is what makes a child exit when we
+        # die (see _watch_parent). A frozen build has no interpreter to hand
+        # a script to anyway, so it runs itself again.
         if FROZEN:
             command = [sys.executable, "--serve", name]
         else:
-            command = [sys.executable, str(SERVICES[name])]
+            command = [sys.executable, str(Path(__file__).resolve()), "--serve", name]
         process = subprocess.Popen(
             command,
             cwd=str(ROOT),
@@ -404,6 +408,12 @@ class TorProcess:
             # To stdout, which is redirected to tor.log below. A `Log ... file`
             # line cannot take a quoted path, so it would break on a space.
             "Log notice stdout",
+            # Tor exits by itself once this process is gone. Our own cleanup
+            # never runs when the app is ended abruptly -- and on macOS that
+            # includes Cmd-Q, which terminates without returning to Python --
+            # and a tor left behind keeps the onion service published and
+            # holds the data directory, so the next launch cannot start one.
+            f"__OwningControllerProcess {os.getpid()}",
         ]
         if self.publish_port:
             lines += [
@@ -468,10 +478,19 @@ class TorProcess:
         log = self.root / "tor.log"
         detail = ""
         try:
-            tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-6:]
+            text = log.read_text(encoding="utf-8", errors="replace")
+            tail = text.strip().splitlines()[-6:]
             detail = "\n    ".join(tail)
         except OSError:
-            pass
+            text = ""
+        if "another Tor process is running with the same data directory" in text:
+            return (
+                "Another copy of Spectre is still using Tor on this computer -- "
+                "one that is open, or one that was closed and is still shutting "
+                "down. Quit it, wait half a minute, and try again. If it keeps "
+                "happening, restarting the computer clears it.\n"
+                f"  Log: {log}"
+            )
         return (
             f"tor {what}.\n"
             f"  Log: {log}\n"
@@ -577,8 +596,47 @@ def _parse_args():
     return parser.parse_args()
 
 
+def _watch_parent() -> None:
+    """
+    Exit when the launcher that started us is gone.
+
+    Its cleanup stops us on a normal exit, but it never runs when the app is
+    ended abruptly -- a crash, a force quit, or Cmd-Q on macOS, which
+    terminates without returning to Python. A relay left behind goes on
+    listening with nobody attached, and keeps its port.
+    """
+    parent = int(os.environ.get("SPECTRE_PARENT_PID", "0") or 0)
+    if not parent:
+        return
+
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # A handle, not a pid: it keeps meaning *that* process even if the pid
+        # is reused. os.kill(pid, 0) is no test on Windows -- it terminates.
+        handle = kernel32.OpenProcess(0x00100000, False, parent)      # SYNCHRONIZE
+        if not handle:
+            os._exit(0)
+
+        def alive():
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102   # WAIT_TIMEOUT
+    else:
+        # Once the parent dies we are re-parented, so the pid we were started
+        # under stops being our parent -- immune to the pid being reused.
+        def alive():
+            return os.getppid() == parent
+
+    def watch():
+        while alive():
+            time.sleep(2)
+        os._exit(0)
+
+    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+
 def _serve(name: str) -> None:
     """Run the relay or backend in this process, as its own script would."""
+    _watch_parent()
     # A windowed PyInstaller build starts with no sys.stdout or sys.stderr at
     # all, and Werkzeug and logging both write to them. The handles
     # LocalRelay passed in point at the log file, so reattach those.

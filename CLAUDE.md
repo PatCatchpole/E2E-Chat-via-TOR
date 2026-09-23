@@ -116,6 +116,14 @@ Each of these was a live vulnerability; each has a test that fails if it returns
   so a killed launcher cannot leave a relay or an onion service running
   unattended. It used to cover the relay only and orphaned tor. Verified by
   closing the pty; do not remove it.
+- Cleanup in Python is not enough on its own. Cmd-Q in the desktop window makes
+  AppKit terminate the process without returning to Python, so neither
+  `finally`, `atexit` nor a signal handler runs (v1.0.0/1 left relay, backend
+  and tor running after every Cmd-Q, and the next launch's tor refused the
+  locked DataDirectory). So children also watch us: tor via
+  `__OwningControllerProcess`, relay and backend via `_watch_parent` in
+  `--serve` -- which is why the launcher starts them through `--serve` even
+  from source. Verified with kill -9 on the launcher: all gone within ~6s.
 - The packaged build (`packaging/`) is `spectre.py` frozen by PyInstaller. It
   re-executes itself with `--serve relay|backend`, and runs those scripts via
   runpy, so their imports are invisible to analysis — anything they need goes

@@ -13,6 +13,7 @@ the HTTP contract, which `tools/dev_backend.py` covers.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -244,7 +245,10 @@ def test_the_relay_refuses_to_start_without_a_token():
     result = subprocess.run(
         [sys.executable, "server/app.py"],
         capture_output=True, text=True, timeout=30,
-        env={"PATH": "/usr/bin:/bin", "SPECTRE_INTERNAL_TOKEN": ""},
+        # The real environment with the token blanked, not an empty one:
+        # Windows cannot initialise Winsock without SYSTEMROOT, and the relay
+        # would die on import before it reached the token check.
+        env={**os.environ, "SPECTRE_INTERNAL_TOKEN": ""},
     )
     assert result.returncode != 0
     assert "SPECTRE_INTERNAL_TOKEN" in (result.stdout + result.stderr)
@@ -280,7 +284,12 @@ def test_a_correct_password_does_not_leave_the_account_locked(backend):
     sign_in(later, "alice")
 
 
-def test_packet_flooding_is_rate_limited(backend):
+def test_packet_flooding_is_rate_limited(backend, monkeypatch):
+    # The bucket refills continuously, so on a slow machine the flood takes
+    # long enough to earn a token back and one extra packet gets through. An
+    # effectively infinite window takes refill out of what is being tested.
+    monkeypatch.setattr(relay, "packet_limit",
+                        relay.RateLimiter(relay.PACKETS_PER_SOCKET, 10 ** 9))
     alice, bob = connect(), connect()
     join(alice, "alice")
     join(bob, "bob")

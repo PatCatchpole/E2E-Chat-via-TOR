@@ -112,7 +112,13 @@ Each of these was a live vulnerability; each has a test that fails if it returns
 - The client tries SOCKS 9050 then 9150 by *connecting*, not by checking for a
   listener: Tor Browser holds 9150 open with `DisableNetwork 1` until you click
   Connect, so a probe cannot tell a working proxy from an idle one.
-- `spectre.py --tor` runs its own `tor` under `~/.spectre/tor` on its own
+- The launcher is Tor-only by design: hosting always publishes an onion
+  service with the relay bound to 127.0.0.1, and joining refuses anything but
+  an onion address. Do not reintroduce a LAN host option -- the relay is plain
+  HTTP and the login verifier crossed the network readable. `--tor` is a no-op
+  kept for old shortcuts. The manual `client_cli.py` path still allows local
+  addresses for development.
+- `spectre.py` runs its own `tor` under `~/.spectre/tor` on its own
   SocksPort, so it never fights a system daemon or Tor Browser. The service key
   there is what keeps the `.onion` address stable — treat it as key material.
 - `dev.env` is gitignored and holds a placeholder token; never commit a real one.

@@ -30,9 +30,9 @@ to install.
 | macOS   | `Spectre-macos-arm64`        |
 | Linux   | `Spectre-linux-x86_64`       |
 
-Choose **Host a room anyone can join over Tor**, send the `.onion` address it
+Choose **Host a room on Tor**, send the `.onion` address it
 shows to your friends, and sign in. They choose **Join**, paste the address
-into the relay field, and sign in too. Joining starts the app's own Tor in the
+into the onion address field, and sign in too. Joining starts the app's own Tor in the
 background, so nobody needs Tor Browser open.
 
 The builds are not signed with a paid developer certificate, so the first launch
@@ -56,12 +56,12 @@ python spectre.py
 
 On macOS you can also double-click **Spectre.command** in Finder.
 
-To let people join from anywhere rather than just your network, choose
-**Host a room anyone can join over Tor** (or pass `--tor` to preselect it).
-
-It asks whether to host a room or join one. Hosting starts the relay and its
-backend for you and shows the address to pass to whoever is joining; joining
-just wants that address. Then it signs you in and drops you into the chat.
+The launcher is Tor-only. It asks whether to host a room or join one. Hosting
+starts the relay and its backend, publishes them as an onion service and shows
+the `.onion` address to pass to whoever is joining; joining accepts only that
+address. There is no local-network mode: the relay listens on loopback and the
+onion service is the only way in. (The manual path below still runs on plain
+local addresses, for development.) Then it signs you in and drops you into the chat.
 
 > Hosting this way uses the in-memory backend (`tools/dev_backend.py`), so
 > **accounts and message history last only as long as the window stays open**.
@@ -125,8 +125,8 @@ back-end/spectre-chat Spring Boot service
 - Java 21 and Maven (the backend targets Spring Boot 4)
 - PostgreSQL
 - Tor, for `.onion` operation — a `tor` daemon (`brew install tor`) or Tor
-  Browser. `spectre.py --tor` needs the daemon on PATH; joining an existing
-  `.onion` works with either.
+  Browser. The packaged app carries its own and needs neither; from source,
+  hosting needs the daemon on PATH and joining works with either.
 
 ---
 
@@ -302,11 +302,11 @@ before running `/trust`.
 
 ## 6. Running via Tor
 
-The launcher does the whole thing. Choose **Host a room anyone can join over
-Tor** (`python spectre.py --tor` preselects it), and the room is published as a
-v3 onion service whose address is shown next to the local one. Whoever is
-joining pastes that address into the relay field — joining needs no flag and
-no configuration: the launcher starts a client-only tor of its own under
+The launcher does the whole thing, and it only works this way. Choose **Host a
+room on Tor**, and the room is published as a v3 onion service whose address
+is shown for you to send on. Whoever is joining pastes that address into the
+onion address field — anything that is not an onion address is refused — and
+needs no configuration: the launcher starts a client-only tor of its own under
 `~/.spectre/tor-client` and routes through it. An explicit
 `SPECTRE_TOR_SOCKS_PORT` still wins, and with no tor available at all the client
 falls back to a running daemon on 9050 or Tor Browser on 9150.
@@ -321,9 +321,10 @@ Browser. The service key in `~/.spectre/tor/spectre/` is kept between runs, so
 an address you have handed out keeps working — it is key material, and Tor
 refuses to start unless that directory is `0700`.
 
-Publishing is a separate choice because it makes the relay reachable from the
-entire Tor network. **Host a room on this network only** stays on your own
-network.
+The relay itself binds `127.0.0.1` only, so the onion service is the single
+way in; nothing listens on your local network. If tor cannot publish, hosting
+stops rather than carrying on without it. `--tor` is still accepted, and does
+nothing.
 
 ### By hand
 
@@ -379,10 +380,10 @@ nothing.
   contents are safe either way — they are already end-to-end encrypted before
   they reach it — but the login verifier is not: it is the value the backend
   checks, so anyone who can watch the connection can capture it and sign in as
-  you. Over Tor the circuit is encrypted and this does not arise. On a LAN or
-  across the internet without Tor it does, including the address the launcher
-  offers under "Share this". Host with `--tor`, or put TLS in front of the
-  relay.
+  you. Over Tor the circuit is encrypted and this does not arise, which is why
+  the launcher only hosts and joins over Tor and binds the relay to loopback.
+  Running the relay by hand on a LAN or across the internet without Tor still
+  exposes it; put TLS in front of the relay if you do.
 
 - **A compromised endpoint.** Ratchet state on disk is 0600 but not encrypted at
   rest; anyone who can read your files can read your session.
@@ -506,7 +507,7 @@ and covered by tests that fail if the defect returns.
 
 **Group chat** — rooms are a mesh of pairwise sessions; see §1.
 
-**Tor** — `spectre.py --tor` publishes the room as a v3 onion service, managed
+**Tor** — the launcher publishes the room as a v3 onion service, managed
 under `~/.spectre/tor` with no root and no system configuration; see §6.
 
 **Later fixes** — a persisted delivery watermark silently discarded genuinely

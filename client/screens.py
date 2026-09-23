@@ -118,7 +118,6 @@ def _base_bindings(on_cancel):
 
 # ------------------------------------------------------------ start screen
 
-HOST = "host"
 HOST_TOR = "host-tor"
 JOIN = "join"
 
@@ -127,13 +126,13 @@ def start_screen(default: str = JOIN, message: str = ""):
     """
     Host a room on this machine, or join one somebody else is already hosting.
 
-    Returns HOST, HOST_TOR, JOIN, or None if the user quit. This is the only
+    Returns HOST_TOR, JOIN, or None if the user quit. This is the only
     decision that cannot be inferred: somebody has to run the relay, and nothing
     in the saved state says whether that should be us.
 
-    Publishing over Tor is a choice here rather than only a `--tor` flag,
-    because a packaged build is started by double-clicking and has no command
-    line to put a flag on.
+    There is no local-network host: a room is always published as an onion
+    service and always joined through Tor. The relay speaks plain HTTP, so on
+    a LAN the login verifier crossed the network readable by anyone on it.
     """
     error = {"text": message}
 
@@ -143,8 +142,7 @@ def start_screen(default: str = JOIN, message: str = ""):
     choices = SubmitOnEnterList(
         values=[
             (JOIN, "Join a room somebody else is hosting"),
-            (HOST_TOR, "Host a room anyone can join over Tor"),
-            (HOST, "Host a room on this network only"),
+            (HOST_TOR, "Host a room on Tor"),
         ],
         on_submit=lambda: submit(),
         default=default,
@@ -186,14 +184,13 @@ def start_screen(default: str = JOIN, message: str = ""):
 # ------------------------------------------------------- hosting confirmed
 
 
-def host_ready_screen(addresses: list, onion: str = None):
+def host_ready_screen(onion: str):
     """
-    Show where the relay is listening so the address can be read out.
+    Show the onion address so it can be copied and sent to whoever is joining.
 
-    `addresses` is a list of (label, value) pairs. `onion`, when the room is
-    published over Tor, gets a line of its own: a v3 address is 62 characters
-    and would be truncated in a labelled column on an 80-wide terminal, which
-    for an address somebody has to copy exactly is worse than useless.
+    It gets a line of its own: a v3 address is 62 characters and would be
+    truncated in a labelled column on an 80-wide terminal, which for an
+    address somebody has to copy exactly is worse than useless.
 
     Returns True to carry on to sign in, or None to quit -- quitting here
     stops the relay again, so it has to be distinguishable from continuing.
@@ -201,33 +198,23 @@ def host_ready_screen(addresses: list, onion: str = None):
     def submit():
         app.exit(result=True)
 
-    rows = [Window(height=1)]
-    for label, value in addresses:
-        rows.append(_labelled(label, Window(
-            FormattedTextControl([("class:peer", value)]), height=1,
-        ), label_width=12))
-
-    if onion:
-        rows.append(Window(height=1))
-        rows.append(Window(FormattedTextControl([
-            ("class:dim", "Join from anywhere over Tor:")
-        ]), height=1))
-        rows.append(Window(FormattedTextControl([
-            ("class:peer", onion)
-        ]), height=1))
-
-    rows.append(Window(height=1))
-    rows.append(Window(FormattedTextControl([
-        ("class:dim", "Anyone on your network can join with the address above.")
-    ]), height=1))
-    rows.append(Window(FormattedTextControl([
-        ("class:dim", "Closing this window stops the relay and ends the room.")
-    ]), height=1))
-    # The launcher hosts with the in-memory backend, so this is not a detail
-    # somebody should discover by losing their account.
-    rows.append(Window(FormattedTextControl([
-        ("class:error", "Accounts and history are kept in memory only, and are lost on exit.")
-    ]), height=1))
+    rows = [
+        Window(height=1),
+        Window(FormattedTextControl([
+            ("class:dim", "Send this address to the people you want in the room:")
+        ]), height=1),
+        Window(height=1),
+        Window(FormattedTextControl([("class:peer", onion)]), height=1),
+        Window(height=1),
+        Window(FormattedTextControl([
+            ("class:dim", "Closing this window stops the relay and ends the room.")
+        ]), height=1),
+        # The launcher hosts with the in-memory backend, so this is not a
+        # detail somebody should discover by losing their account.
+        Window(FormattedTextControl([
+            ("class:error", "Accounts and history are kept in memory only, and are lost on exit.")
+        ]), height=1),
+    ]
 
     kb = _base_bindings(lambda event: event.app.exit(result=None))
 
@@ -269,7 +256,7 @@ def host_ready_screen(addresses: list, onion: str = None):
 
 
 def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
-                 message: str = ""):
+                 message: str = "", relay_label: str = "Relay"):
     """
     Collect connection details.
 
@@ -279,15 +266,20 @@ def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
     people in it.
     Credentials are not checked here -- that happens when the session connects,
     so a failure comes back as `message` on the next pass.
+
+    `relay=None` hides the relay field altogether: a host signs in to its own
+    relay, and showing a loopback address there only invites editing it.
     """
+    show_relay = relay is not None
+    relay = relay or ""
     error = {"text": message}
 
     relay_field = TextArea(text=relay, multiline=False, wrap_lines=False, height=1)
     user_field = TextArea(text=username, multiline=False, wrap_lines=False, height=1)
     pass_field = TextArea(password=True, multiline=False, wrap_lines=False, height=1)
     def submit():
-        if not relay_field.text.strip():
-            error["text"] = "A relay address is required."
+        if show_relay and not relay_field.text.strip():
+            error["text"] = f"{relay_label} is required."
         elif not user_field.text.strip():
             error["text"] = "A username is required."
         elif not pass_field.text:
@@ -315,12 +307,13 @@ def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
         Window(FormattedTextControl(_banner_block), height=len(BANNER) + 1),
         Window(height=1),
         Frame(
-            Box(HSplit([
-                _labelled("Relay", relay_field),
+            Box(HSplit(([
+                _labelled(relay_label, relay_field, label_width=15),
                 Window(height=1),
-                _labelled("Username", user_field),
+            ] if show_relay else []) + [
+                _labelled("Username", user_field, label_width=15 if show_relay else 11),
                 Window(height=1),
-                _labelled("Password", pass_field),
+                _labelled("Password", pass_field, label_width=15 if show_relay else 11),
             ]), padding_left=1, padding_right=1, padding_top=1, padding_bottom=1),
             title="Sign in",
         ),
@@ -340,7 +333,9 @@ def login_screen(relay: str = "127.0.0.1:5055", username: str = "",
 
     root = Box(body, padding_left=4, padding_right=4)
     app = Application(
-        layout=Layout(root, focused_element=user_field if not username else pass_field),
+        layout=Layout(root, focused_element=(
+            relay_field if show_relay and not relay
+            else user_field if not username else pass_field)),
         key_bindings=kb, style=STYLE, full_screen=True, mouse_support=False,
     )
     return app.run()

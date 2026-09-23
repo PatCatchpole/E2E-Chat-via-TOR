@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import re
 import runpy
 import secrets
 import signal
@@ -49,6 +50,10 @@ sys.path.insert(0, str(CLIENT_DIR))
 RELAY_SCRIPT = ROOT / "server" / "app.py"
 BACKEND_SCRIPT = ROOT / "tools" / "dev_backend.py"
 SERVICES = {"relay": RELAY_SCRIPT, "backend": BACKEND_SCRIPT}
+
+# What `client_cli.resolve_relay` makes of a v3 onion address. Anything else
+# typed into the join screen is refused, since the launcher only uses Tor.
+ONION_URL = re.compile(r"^http://[a-z2-7]{56}\.onion(:\d+)?$")
 
 # 5000 is AirPlay Receiver on macOS, which answers 403 rather than refusing the
 # connection -- an error that looks like a relay bug. Start above it.
@@ -148,24 +153,6 @@ def _wait_until_listening(port: int, process=None, timeout: float = STARTUP_TIME
     return False
 
 
-def _lan_address():
-    """
-    This machine's address on the local network, or None.
-
-    Opening a UDP socket towards a public address sends no packets; it just
-    makes the kernel choose a route, which is the only reliable way to find
-    which of several interfaces a peer would actually reach us on.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except OSError:
-        return None
-    finally:
-        sock.close()
-
-
 # ------------------------------------------------------------ children
 
 
@@ -247,9 +234,11 @@ class LocalRelay:
             "SPECTRE_INTERNAL_TOKEN": self.token,
             "SPECTRE_BACKEND_PORT": str(self.backend_port),
             "SPECTRE_BACKEND_URL": f"http://127.0.0.1:{self.backend_port}",
-            # Bound to every interface so other machines can reach the room.
-            # The client below still connects over loopback.
-            "SPECTRE_RELAY_HOST": "0.0.0.0",
+            # Loopback only. People reach the room through the onion service,
+            # which tor forwards here; binding every interface as well would
+            # put the relay's plain HTTP -- login verifiers included -- on the
+            # local network for anyone on it to read.
+            "SPECTRE_RELAY_HOST": "127.0.0.1",
             "SPECTRE_RELAY_PORT": str(self.relay_port),
             "SPECTRE_ALLOW_DEV_SERVER": "1",
             "SPECTRE_LOG_LEVEL": "WARNING",
@@ -338,13 +327,6 @@ class LocalRelay:
     @property
     def local_url(self) -> str:
         return f"http://127.0.0.1:{self.relay_port}"
-
-    def addresses(self) -> list:
-        rows = [("On this Mac", f"127.0.0.1:{self.relay_port}")]
-        lan = _lan_address()
-        if lan:
-            rows.append(("Share this", f"{lan}:{self.relay_port}"))
-        return rows
 
 
 class TorProcess:
@@ -521,37 +503,49 @@ def _relay_token() -> str:
 # ------------------------------------------------------------------ flow
 
 
-def _sign_in(screens, storage, client_cli, relay_default: str, choice: str):
+def _sign_in(screens, storage, client_cli, relay, choice: str):
     """
     Sign in, then pick a room. Returns the details dict, or None to quit.
 
-    When hosting, the relay field is prefilled with our own address but stays
-    editable -- silently overriding what somebody typed would be worse than
-    letting them point elsewhere on purpose.
+    `relay` is our own relay's address when hosting, and the field is hidden.
+    When joining it is whatever onion address was used last, or empty, and
+    anything that is not an onion address is refused: this launcher only
+    connects through Tor.
     """
     prefs = storage.load_launcher_prefs()
     username = prefs.get("user", "")
+    hosting = choice == screens.HOST_TOR
     message = ""
 
     while True:
         credentials = screens.login_screen(
-            relay=relay_default, username=username, message=message,
+            relay=None if hosting else relay, username=username,
+            message=message, relay_label="Onion address",
         )
         if credentials is None:
             return None
 
         username = credentials["user"]
-        relay_default = credentials["relay"]
-        url, use_tor = client_cli.resolve_relay(relay_default)
+        if hosting:
+            url, use_tor = relay, False
+        else:
+            # Onion addresses are base32 and case-insensitive; tor wants lower.
+            relay = credentials["relay"].strip().lower()
+            url, use_tor = client_cli.resolve_relay(relay)
+            if not use_tor or not ONION_URL.match(url):
+                message = ("That is not an onion address. Paste the 56-character "
+                           ".onion address your host sent you.")
+                continue
 
         room = screens.room_screen(username, storage.list_rooms(username))
         if room is None:
             message = ""
             continue                    # back to sign in
 
-        storage.save_launcher_prefs({
-            "user": username, "relay": relay_default, "start": choice,
-        })
+        saved = {"user": username, "start": choice}
+        if not hosting:
+            saved["relay"] = relay
+        storage.save_launcher_prefs(saved)
         return {
             "user": username, "password": credentials["password"],
             "url": url, "use_tor": use_tor, "room": room,
@@ -563,11 +557,9 @@ def _parse_args():
         prog="spectre.py",
         description="Start Spectre: host a room or join one.",
     )
-    parser.add_argument(
-        "--tor", action="store_true",
-        help="preselect hosting over Tor on the start screen. Joining over "
-             "Tor needs no flag -- just paste the .onion address.",
-    )
+    # Everything goes through Tor now, so there is nothing left to switch on.
+    # Accepted and ignored so existing shortcuts keep working.
+    parser.add_argument("--tor", action="store_true", help=argparse.SUPPRESS)
     # Internal: how a frozen build runs its own relay and backend.
     parser.add_argument("--serve", choices=sorted(SERVICES), help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -581,14 +573,11 @@ def _serve(name: str) -> None:
     runpy.run_path(str(script), run_name="__main__")
 
 
-def _start_screen_default(screens, prefs: dict, args) -> str:
-    if args.tor:
+def _start_screen_default(screens, prefs: dict) -> str:
+    # "host" and "hosted" are from builds that could host on the local network.
+    if prefs.get("start") in ("host", screens.HOST_TOR) or prefs.get("hosted"):
         return screens.HOST_TOR
-    choice = prefs.get("start")
-    if choice in (screens.HOST, screens.HOST_TOR, screens.JOIN):
-        return choice
-    # Preferences written before hosting over Tor was a menu choice.
-    return screens.HOST if prefs.get("hosted") else screens.JOIN
+    return screens.JOIN
 
 
 def _tor_for_joining(session_module):
@@ -636,14 +625,14 @@ def main() -> None:
         )
 
     prefs = storage.load_launcher_prefs()
-    choice = screens.start_screen(default=_start_screen_default(screens, prefs, args))
+    choice = screens.start_screen(default=_start_screen_default(screens, prefs))
     if choice is None:
         return
 
     relay = None
     tor = None
     try:
-        if choice in (screens.HOST, screens.HOST_TOR):
+        if choice == screens.HOST_TOR:
             relay = LocalRelay(_relay_token())
             print("Starting the relay ...")
             try:
@@ -651,28 +640,26 @@ def main() -> None:
             except RuntimeError as error:
                 sys.exit(str(error))
 
-            if choice == screens.HOST_TOR:
-                # Publishing reaches the whole Tor network, so it is a
-                # separate choice rather than something hosting does on your
-                # behalf.
-                print("Publishing the room on Tor (this takes a minute) ...")
-                tor = TorProcess(publish_port=relay.relay_port)
-                try:
-                    tor.start()
-                except RuntimeError as error:
-                    tor = None
-                    print(f"\nCould not publish over Tor: {error}\n"
-                          f"Carrying on with the local room only.\n")
+            # Publishing is the only way in: the relay listens on loopback, so
+            # a room that is not on Tor is a room nobody else can reach.
+            print("Publishing the room on Tor (this takes a minute) ...")
+            tor = TorProcess(publish_port=relay.relay_port)
+            try:
+                tor.start()
+            except RuntimeError as error:
+                tor = None
+                sys.exit(f"Could not publish the room on Tor: {error}")
 
-            if screens.host_ready_screen(
-                    relay.addresses(),
-                    onion=tor.hostname if tor else None) is None:
+            if screens.host_ready_screen(tor.hostname) is None:
                 return
-            relay_default = f"127.0.0.1:{relay.relay_port}"
+            relay_address = relay.local_url
         else:
-            relay_default = prefs.get("relay") or f"127.0.0.1:{PREFERRED_RELAY_PORT}"
+            # Only a previously used onion address is offered again; anything
+            # else a preferences file holds is from a build that allowed it.
+            saved = prefs.get("relay") or ""
+            relay_address = saved if client_cli.resolve_relay(saved)[1] else ""
 
-        details = _sign_in(screens, storage, client_cli, relay_default, choice)
+        details = _sign_in(screens, storage, client_cli, relay_address, choice)
         if details is None:
             return
 

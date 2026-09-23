@@ -15,6 +15,7 @@ python spectre.py                          # the launcher: starts everything, no
 python -m pytest tests/ -q                 # 102 tests, ~3s, all passing
 cd back-end/spectre-chat && mvn -B compile # Java 25 + Maven are installed and it builds
 cd back-end/spectre-chat && mvn -B test -Dtest=MessageWireFormatTest   # pins the stored-message format
+python packaging/build.py                  # one-file dist/Spectre with tor inside (pyinstaller is in the venv)
 ```
 
 The manual path, for working on one piece at a time:
@@ -89,9 +90,18 @@ Each of these was a live vulnerability; each has a test that fails if it returns
 
 - The launcher's child processes run in their own process group so Ctrl-C does
   not kill the relay before session state is saved. That makes `atexit`
-  insufficient: `LocalRelay._install_signal_handlers` catches SIGTERM and SIGHUP
-  (what closing the Terminal window sends) so a killed launcher cannot leave a
-  relay listening on the network unattended. Verified; do not remove it.
+  insufficient: `_stop_on_exit` registers every child (relay, backend, tor) with
+  one SIGTERM/SIGHUP handler (SIGHUP is what closing the Terminal window sends)
+  so a killed launcher cannot leave a relay or an onion service running
+  unattended. It used to cover the relay only and orphaned tor. Verified by
+  closing the pty; do not remove it.
+- The packaged build (`packaging/`) is `spectre.py` frozen by PyInstaller. It
+  re-executes itself with `--serve relay|backend`, and runs those scripts via
+  runpy, so their imports are invisible to analysis — anything they need goes
+  in `hiddenimports` in `spectre.spec`. Tor is the pinned expert bundle,
+  ad-hoc signed on macOS (Apple Silicon SIGKILLs unsigned binaries, exit 137).
+  Test a build end to end, not just `--serve`: the TUI renders by diff, so
+  scraping a pty for a message is unreliable — check the saved ratchet state.
 - Hosting from the launcher uses the **in-memory** backend, so accounts and
   history die with the window. The hosting screen says so — keep it saying so.
 

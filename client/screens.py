@@ -119,6 +119,7 @@ def _base_bindings(on_cancel):
 # ------------------------------------------------------------ start screen
 
 HOST = "host"
+HOST_TOR = "host-tor"
 JOIN = "join"
 
 
@@ -126,9 +127,13 @@ def start_screen(default: str = JOIN, message: str = ""):
     """
     Host a room on this machine, or join one somebody else is already hosting.
 
-    Returns HOST, JOIN, or None if the user quit. This is the only decision
-    that cannot be inferred: somebody has to run the relay, and nothing in the
-    saved state says whether that should be us.
+    Returns HOST, HOST_TOR, JOIN, or None if the user quit. This is the only
+    decision that cannot be inferred: somebody has to run the relay, and nothing
+    in the saved state says whether that should be us.
+
+    Publishing over Tor is a choice here rather than only a `--tor` flag,
+    because a packaged build is started by double-clicking and has no command
+    line to put a flag on.
     """
     error = {"text": message}
 
@@ -138,7 +143,8 @@ def start_screen(default: str = JOIN, message: str = ""):
     choices = SubmitOnEnterList(
         values=[
             (JOIN, "Join a room somebody else is hosting"),
-            (HOST, "Host a room on this machine"),
+            (HOST_TOR, "Host a room anyone can join over Tor"),
+            (HOST, "Host a room on this network only"),
         ],
         on_submit=lambda: submit(),
         default=default,

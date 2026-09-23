@@ -19,7 +19,36 @@ cost is that traffic grows with the square of the room size, which is why
 
 ## 0. Quick start
 
-Nothing to configure, and no second terminal:
+**Easiest: the packaged app.** Download the file for your system from the
+repository's GitHub Releases (or the latest `build` workflow run) and
+double-click it. Python, every dependency and Tor are inside; there is nothing
+to install.
+
+| System  | File                         |
+|---------|------------------------------|
+| Windows | `Spectre-windows-x86_64.exe` |
+| macOS   | `Spectre-macos-arm64`        |
+| Linux   | `Spectre-linux-x86_64`       |
+
+Choose **Host a room anyone can join over Tor**, send the `.onion` address it
+shows to your friends, and sign in. They choose **Join**, paste the address
+into the relay field, and sign in too. Joining starts the app's own Tor in the
+background, so nobody needs Tor Browser open.
+
+The builds are not signed with a paid developer certificate, so the first launch
+needs one extra click:
+
+- **macOS** — "cannot be opened because Apple cannot verify it": right-click the
+  file, choose **Open**, then **Open** again (on macOS 15, allow it under
+  System Settings → Privacy & Security → **Open Anyway**). A file downloaded by
+  a browser may also need `chmod +x Spectre-macos-arm64` once.
+- **Windows** — SmartScreen: **More info** → **Run anyway**.
+- **Linux** — `chmod +x Spectre-linux-x86_64` and run it from a terminal;
+  most file managers do not open a terminal for it.
+
+To build it yourself, see §4.1.
+
+**From source.** Nothing to configure, and no second terminal:
 
 ```bash
 python spectre.py
@@ -27,11 +56,8 @@ python spectre.py
 
 On macOS you can also double-click **Spectre.command** in Finder.
 
-To let people join from anywhere rather than just your network, host with Tor:
-
-```bash
-python spectre.py --tor
-```
+To let people join from anywhere rather than just your network, choose
+**Host a room anyone can join over Tor** (or pass `--tor` to preselect it).
 
 It asks whether to host a room or join one. Hosting starts the relay and its
 backend for you and shows the address to pass to whoever is joining; joining
@@ -68,6 +94,10 @@ client  <--- Socket.IO (Tor) --->  relay  <--- HTTP (loopback) --->  backend  --
 ```text
 spectre.py            launcher: host or join, starts the relay, then signs in
 Spectre.command       double-clickable wrapper for Finder
+packaging/
+  build.py            one-file executable: fetches + verifies tor, runs PyInstaller
+  spectre.spec        PyInstaller spec
+.github/workflows/    builds the executable for Windows, macOS and Linux
 client/
   client_cli.py       client entry point, argument and prompt handling
   screens.py          start, sign-in and room-picker screens
@@ -211,6 +241,26 @@ and nothing more.
 > requests with `403`. Either turn it off in System Settings → General →
 > AirDrop & Handoff, or set `SPECTRE_RELAY_PORT` to something else.
 
+### 4.1 Building the packaged app
+
+```bash
+pip install -r requirements-build.txt
+python packaging/build.py            # -> dist/Spectre, or dist\Spectre.exe
+```
+
+This builds for the system it runs on; PyInstaller cannot cross-compile. The
+`build` GitHub Actions workflow runs it on Windows, macOS and Linux, smoke-tests
+each result, and attaches all three to a release when a `v*` tag is pushed.
+
+The Tor Project's *expert bundle* is downloaded and checked against a SHA-256
+pinned in `packaging/build.py` — not against a checksum fetched from the same
+server. To move to a newer tor, update `TOR_VERSION` and the four pins from
+that release's `sha256sums-signed-build.txt`, after checking its `.asc`.
+
+The executable is the launcher. When hosting it starts the relay and the backend
+by running itself again with `--serve relay` / `--serve backend`, because a
+frozen build has no Python interpreter to hand a script to.
+
 ---
 
 ## 5. Using the chat screen
@@ -252,15 +302,17 @@ before running `/trust`.
 
 ## 6. Running via Tor
 
-The launcher does the whole thing:
+The launcher does the whole thing. Choose **Host a room anyone can join over
+Tor** (`python spectre.py --tor` preselects it), and the room is published as a
+v3 onion service whose address is shown next to the local one. Whoever is
+joining pastes that address into the relay field — joining needs no flag and
+no configuration: the launcher starts a client-only tor of its own under
+`~/.spectre/tor-client` and routes through it. An explicit
+`SPECTRE_TOR_SOCKS_PORT` still wins, and with no tor available at all the client
+falls back to a running daemon on 9050 or Tor Browser on 9150.
 
-```bash
-python spectre.py --tor
-```
-
-Choose **Host**, and the room is published as a v3 onion service whose address
-is shown next to the local one. Whoever is joining pastes that address into the
-relay field — joining needs no flag and no configuration.
+The launcher uses the tor bundled into the packaged app, then one on `PATH`
+or in the usual Homebrew locations.
 
 Everything lives under `~/.spectre/tor`: its own `torrc`, its own
 `DataDirectory` and its own `SocksPort`. Nothing in `/etc` is touched and no
@@ -269,8 +321,9 @@ Browser. The service key in `~/.spectre/tor/spectre/` is kept between runs, so
 an address you have handed out keeps working — it is key material, and Tor
 refuses to start unless that directory is `0700`.
 
-Publishing is opt-in because it makes the relay reachable from the entire Tor
-network. Hosting without `--tor` stays on your own network.
+Publishing is a separate choice because it makes the relay reachable from the
+entire Tor network. **Host a room on this network only** stays on your own
+network.
 
 ### By hand
 

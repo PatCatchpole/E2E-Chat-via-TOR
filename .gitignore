@@ -27,3 +27,7 @@ ephemeral_key
 
 # Local dev config (contains a token)
 dev.env
+
+# Packaged build (packaging/build.py)
+/build/
+/dist/

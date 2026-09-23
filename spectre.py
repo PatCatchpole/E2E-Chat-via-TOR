@@ -13,6 +13,11 @@ when hosting, and then hands over to the sign-in screen and the chat UI.
 `client_cli.py` is still the client, and is unchanged in what it does; this
 only removes the setup around it. Anything this launcher does by hand can still
 be done by hand -- see README §4.
+
+It is also the entry point of the packaged build (`packaging/`), where Python,
+every dependency and a tor binary are frozen into one executable. That build
+has no interpreter to hand a script to, so the relay and backend are started
+by running this same executable again with `--serve`.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import runpy
 import secrets
 import signal
 import shutil
@@ -29,7 +35,10 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+# In a PyInstaller build the sources are unpacked to a temporary directory
+# named by `sys._MEIPASS`, and `sys.executable` is the bundle, not Python.
+FROZEN = bool(getattr(sys, "frozen", False))
+ROOT = Path(sys._MEIPASS) if FROZEN else Path(__file__).resolve().parent
 CLIENT_DIR = ROOT / "client"
 
 # The client imports its own modules flat (`storage`, `session`, `crypto.*`),
@@ -39,6 +48,7 @@ sys.path.insert(0, str(CLIENT_DIR))
 
 RELAY_SCRIPT = ROOT / "server" / "app.py"
 BACKEND_SCRIPT = ROOT / "tools" / "dev_backend.py"
+SERVICES = {"relay": RELAY_SCRIPT, "backend": BACKEND_SCRIPT}
 
 # 5000 is AirPlay Receiver on macOS, which answers 403 rather than refusing the
 # connection -- an error that looks like a relay bug. Start above it.
@@ -47,11 +57,23 @@ PREFERRED_BACKEND_PORT = 8090
 
 STARTUP_TIMEOUT = 20
 
-# Homebrew does not put tor on a login shell's PATH for every setup, so the
-# usual install locations are checked too rather than failing with "not found"
-# on a machine that has it.
+# The packaged build carries its own tor (the Tor Project's expert bundle) so
+# that nobody has to install one; it is always preferred when present.
+# Otherwise Homebrew does not put tor on a login shell's PATH for every setup,
+# so the usual install locations are checked too rather than failing with
+# "not found" on a machine that has it.
+BUNDLED_TOR = ROOT / "tor" / ("tor.exe" if os.name == "nt" else "tor")
 TOR_BINARIES = ("tor", "/opt/homebrew/bin/tor", "/usr/local/bin/tor", "/usr/bin/tor")
 TOR_BOOTSTRAP_TIMEOUT = 120
+
+# Children must not share our Ctrl-C. POSIX gets that from a new session;
+# Windows delivers Ctrl-C to the whole console process group instead, so the
+# child needs a group of its own. Closing the console window still ends every
+# process attached to it, so nothing is left listening unattended.
+if os.name == "nt":
+    DETACHED = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+else:
+    DETACHED = {"start_new_session": True}
 
 
 # ---------------------------------------------------------------- guards
@@ -144,6 +166,57 @@ def _lan_address():
         sock.close()
 
 
+# ------------------------------------------------------------ children
+
+
+_STOPPERS = []
+
+
+def _stop_on_exit(stop) -> None:
+    """
+    Run `stop` when we exit, however we exit.
+
+    `atexit` covers a normal return and Ctrl-C, but not SIGTERM or SIGHUP --
+    and SIGHUP is what closing the Terminal window sends. Every child runs in
+    its own process group, so it does not receive those signals itself, and
+    without this it would be orphaned and go on listening on the network with
+    nobody attached to it.
+
+    One shared list rather than a handler per child: the handler used to belong
+    to the relay alone, so a closed window stopped the relay and left tor
+    running -- still publishing the onion address, and in a packaged build
+    still running out of a temporary directory that was never cleaned up.
+    """
+    if not _STOPPERS:
+        atexit.register(_stop_all)
+        _install_signal_handlers()
+    _STOPPERS.append(stop)
+
+
+def _stop_all() -> None:
+    while _STOPPERS:
+        try:
+            _STOPPERS.pop()()
+        except Exception:
+            pass
+
+
+def _install_signal_handlers() -> None:
+    def handler(signum, _frame):
+        _stop_all()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)      # exit as the signal intended
+
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:
+            signal.signal(number, handler)
+        except (OSError, ValueError):
+            pass                          # not the main thread, or unsupported
+
+
 # ------------------------------------------------------------ local relay
 
 
@@ -183,44 +256,19 @@ class LocalRelay:
             "PYTHONUNBUFFERED": "1",
         })
 
-        backend = self._spawn(BACKEND_SCRIPT, environment, "backend")
+        backend = self._spawn(environment, "backend")
         if not _wait_until_listening(self.backend_port, backend):
             self.stop()
             raise RuntimeError(self._failure("backend", backend))
 
-        relay = self._spawn(RELAY_SCRIPT, environment, "relay")
+        relay = self._spawn(environment, "relay")
         if not _wait_until_listening(self.relay_port, relay):
             self.stop()
             raise RuntimeError(self._failure("relay", relay))
 
-        atexit.register(self.stop)
-        self._install_signal_handlers()
+        _stop_on_exit(self.stop)
 
-    def _install_signal_handlers(self) -> None:
-        """
-        Stop the children when we are killed, not just when we exit cleanly.
-
-        `atexit` covers a normal return and Ctrl-C, but not SIGTERM or SIGHUP --
-        and SIGHUP is what closing the Terminal window sends. Because the relay
-        runs in its own process group it does not receive those signals itself,
-        so without this it would be orphaned and go on listening on the network
-        with nobody attached to it.
-        """
-        def handler(signum, _frame):
-            self.stop()
-            signal.signal(signum, signal.SIG_DFL)
-            os.kill(os.getpid(), signum)      # exit as the signal intended
-
-        for name in ("SIGTERM", "SIGHUP"):
-            number = getattr(signal, name, None)
-            if number is None:
-                continue
-            try:
-                signal.signal(number, handler)
-            except (OSError, ValueError):
-                pass                          # not the main thread, or unsupported
-
-    def _spawn(self, script: Path, environment: dict, name: str):
+    def _spawn(self, environment: dict, name: str):
         # 0600 like everything else under ~/.spectre. The relay never logs
         # ciphertext or the token, but it does log who joined which room, and
         # that is exactly the metadata the rest of this directory protects.
@@ -234,8 +282,14 @@ class LocalRelay:
                 os.chmod(path, 0o600)
             except OSError:
                 pass
+        # A frozen build has no interpreter to hand the script to, so it runs
+        # itself again and `--serve` picks the service.
+        if FROZEN:
+            command = [sys.executable, "--serve", name]
+        else:
+            command = [sys.executable, str(SERVICES[name])]
         process = subprocess.Popen(
-            [sys.executable, str(script)],
+            command,
             cwd=str(ROOT),
             env=environment,
             stdout=handle,
@@ -243,7 +297,7 @@ class LocalRelay:
             stdin=subprocess.DEVNULL,
             # Its own process group, so the Ctrl-C that stops the chat UI does
             # not also kill the relay before we have saved session state.
-            start_new_session=(os.name != "nt"),
+            **DETACHED,
         )
         self.processes.append((name, process, handle))
         return process
@@ -293,23 +347,28 @@ class LocalRelay:
         return rows
 
 
-class TorHiddenService:
+class TorProcess:
     """
-    Publishes the relay as a v3 onion service, for as long as we run.
+    A private tor, run for as long as we do: a SOCKS proxy for reaching onion
+    addresses, and optionally a v3 onion service publishing the relay.
 
-    Self-contained under ~/.spectre/tor: its own DataDirectory, its own torrc
-    and its own SocksPort, so it neither needs root nor collides with a system
+    Self-contained under ~/.spectre: its own DataDirectory, its own torrc and
+    its own SocksPort, so it neither needs root nor collides with a system
     `tor` daemon or an open Tor Browser. Nothing in /etc is touched.
 
-    The service key in `spectre/` is what makes the address yours, and it is
-    kept across runs so an address you have handed out keeps working. Tor
-    refuses to start unless that directory is 0700, which is the same standard
-    the rest of ~/.spectre is held to.
+    Hosting and joining use separate directories (`tor` and `tor-client`).
+    Tor locks its DataDirectory, so sharing one would stop somebody from
+    hosting a room in one window and joining another in the next.
+
+    When publishing, the service key in `tor/spectre/` is what makes the
+    address yours, and it is kept across runs so an address you have handed
+    out keeps working. Tor refuses to start unless that directory is 0700,
+    which is the same standard the rest of ~/.spectre is held to.
     """
 
-    def __init__(self, relay_port: int):
-        self.relay_port = relay_port
-        self.root = Path.home() / ".spectre" / "tor"
+    def __init__(self, publish_port: int = None):
+        self.publish_port = publish_port
+        self.root = Path.home() / ".spectre" / ("tor" if publish_port else "tor-client")
         self.service_dir = self.root / "spectre"
         # Our own SOCKS port: 9050 and 9150 may already be taken by a daemon
         # or by Tor Browser, and starting a second tor on a used port fails.
@@ -322,19 +381,28 @@ class TorHiddenService:
 
     @staticmethod
     def binary():
+        if BUNDLED_TOR.exists():
+            return str(BUNDLED_TOR)
         for candidate in TOR_BINARIES:
             path = shutil.which(candidate)
             if path:
                 return path
         return None
 
+    @staticmethod
+    def _path(path: Path) -> str:
+        # Quoted so a home directory with a space in it survives, and with
+        # forward slashes because a quoted torrc value treats backslashes as
+        # escapes -- which every Windows path is full of. Tor on Windows
+        # accepts forward slashes.
+        return '"' + path.as_posix() + '"'
+
     def start(self) -> None:
         binary = self.binary()
         if binary is None:
             raise RuntimeError(
-                "tor is not installed, so the room cannot be published as an "
-                "onion service.\n  Install it with:  brew install tor\n"
-                "  Then run this again with --tor, or host without it."
+                "tor is not installed.\n  Install it with:  brew install tor\n"
+                "  or use a packaged build of Spectre, which carries its own."
             )
 
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -345,38 +413,49 @@ class TorHiddenService:
             except OSError:
                 pass
 
+        lines = [
+            "# Written by spectre.py. Self-contained: no system tor config.",
+            f"SocksPort {self.socks_port}",
+            f"DataDirectory {self._path(self.root / 'data')}",
+            # To stdout, which is redirected to tor.log below. A `Log ... file`
+            # line cannot take a quoted path, so it would break on a space.
+            "Log notice stdout",
+        ]
+        if self.publish_port:
+            lines += [
+                f"HiddenServiceDir {self._path(self.service_dir)}",
+                f"HiddenServicePort 80 127.0.0.1:{self.publish_port}",
+            ]
         torrc = self.root / "torrc"
-        torrc.write_text(
-            "# Written by spectre.py. Self-contained: no system tor config.\n"
-            f"SocksPort {self.socks_port}\n"
-            f"DataDirectory {self.root / 'data'}\n"
-            f"HiddenServiceDir {self.service_dir}\n"
-            f"HiddenServicePort 80 127.0.0.1:{self.relay_port}\n"
-            f"Log notice file {self.root / 'tor.log'}\n",
-            encoding="utf-8",
-        )
+        torrc.write_text("\n".join(lines) + "\n", encoding="utf-8")
         os.chmod(torrc, 0o600)
 
-        log_path = self.root / "tor.log"
-        log_path.unlink(missing_ok=True)
+        environment = dict(os.environ)
+        if binary == str(BUNDLED_TOR) and sys.platform.startswith("linux"):
+            # The expert bundle ships libevent and friends beside the binary;
+            # macOS finds them through @executable_path, Linux needs telling.
+            environment["LD_LIBRARY_PATH"] = str(BUNDLED_TOR.parent)
 
-        descriptor = os.open(self.root / "startup.log",
+        descriptor = os.open(self.root / "tor.log",
                              os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         self.handle = os.fdopen(descriptor, "w", encoding="utf-8")
         self.process = subprocess.Popen(
             [binary, "-f", str(torrc)],
-            cwd=str(ROOT), stdout=self.handle, stderr=subprocess.STDOUT,
+            cwd=str(self.root), env=environment,
+            stdout=self.handle, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             # Same reasoning as the relay: its own process group so the Ctrl-C
             # that stops the chat does not kill it mid-publish.
-            start_new_session=(os.name != "nt"),
+            **DETACHED,
         )
+        _stop_on_exit(self.stop)
 
-        self.hostname = self._await_hostname()
-        atexit.register(self.stop)
+        self._await_bootstrap()
+        if self.publish_port:
+            self.hostname = (self.service_dir / "hostname").read_text(encoding="utf-8").strip()
 
-    def _await_hostname(self) -> str:
-        """Wait for tor to bootstrap and publish, or explain why it did not."""
+    def _await_bootstrap(self) -> None:
+        """Wait for tor to bootstrap (and publish), or explain why it did not."""
         deadline = time.time() + TOR_BOOTSTRAP_TIMEOUT
         hostname_file = self.service_dir / "hostname"
         log_path = self.root / "tor.log"
@@ -384,30 +463,29 @@ class TorHiddenService:
         while time.time() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(self._failure("exited"))
-            if hostname_file.exists():
-                try:
-                    log = log_path.read_text(encoding="utf-8")
-                except OSError:
-                    log = ""
-                if "Bootstrapped 100%" in log:
-                    return hostname_file.read_text(encoding="utf-8").strip()
+            try:
+                log = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                log = ""
+            published = hostname_file.exists() or not self.publish_port
+            if published and "Bootstrapped 100%" in log:
+                return
             time.sleep(1.0)
 
+        self.stop()
         raise RuntimeError(self._failure("did not finish bootstrapping"))
 
     def _failure(self, what: str) -> str:
+        log = self.root / "tor.log"
         detail = ""
-        for candidate in (self.root / "tor.log", self.root / "startup.log"):
-            try:
-                tail = candidate.read_text(encoding="utf-8").strip().splitlines()[-6:]
-            except OSError:
-                continue
-            if tail:
-                detail = "\n    ".join(tail)
-                break
+        try:
+            tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-6:]
+            detail = "\n    ".join(tail)
+        except OSError:
+            pass
         return (
             f"tor {what}.\n"
-            f"  Log: {self.root / 'tor.log'}\n"
+            f"  Log: {log}\n"
             + (f"    {detail}" if detail else "")
         )
 
@@ -443,7 +521,7 @@ def _relay_token() -> str:
 # ------------------------------------------------------------------ flow
 
 
-def _sign_in(screens, storage, client_cli, relay_default: str, hosting: bool):
+def _sign_in(screens, storage, client_cli, relay_default: str, choice: str):
     """
     Sign in, then pick a room. Returns the details dict, or None to quit.
 
@@ -472,7 +550,7 @@ def _sign_in(screens, storage, client_cli, relay_default: str, hosting: bool):
             continue                    # back to sign in
 
         storage.save_launcher_prefs({
-            "user": username, "relay": relay_default, "hosted": hosting,
+            "user": username, "relay": relay_default, "start": choice,
         })
         return {
             "user": username, "password": credentials["password"],
@@ -487,19 +565,66 @@ def _parse_args():
     )
     parser.add_argument(
         "--tor", action="store_true",
-        help="when hosting, also publish the room as a Tor onion service so "
-             "people can join from anywhere. Joining over Tor needs no flag -- "
-             "just paste the .onion address.",
+        help="preselect hosting over Tor on the start screen. Joining over "
+             "Tor needs no flag -- just paste the .onion address.",
     )
+    # Internal: how a frozen build runs its own relay and backend.
+    parser.add_argument("--serve", choices=sorted(SERVICES), help=argparse.SUPPRESS)
     return parser.parse_args()
+
+
+def _serve(name: str) -> None:
+    """Run the relay or backend in this process, as its own script would."""
+    script = SERVICES[name]
+    sys.path.insert(0, str(script.parent))
+    sys.argv = [str(script)]
+    runpy.run_path(str(script), run_name="__main__")
+
+
+def _start_screen_default(screens, prefs: dict, args) -> str:
+    if args.tor:
+        return screens.HOST_TOR
+    choice = prefs.get("start")
+    if choice in (screens.HOST, screens.HOST_TOR, screens.JOIN):
+        return choice
+    # Preferences written before hosting over Tor was a menu choice.
+    return screens.HOST if prefs.get("hosted") else screens.JOIN
+
+
+def _tor_for_joining(session_module):
+    """
+    Start our own tor to reach an onion relay, or None to fall back.
+
+    Without this, joining over Tor only worked for somebody already running a
+    tor daemon or a connected Tor Browser -- one more thing to install and
+    start before the chat would. An explicit SPECTRE_TOR_SOCKS_PORT still
+    wins, and with no tor binary at all the old 9050/9150 search is kept.
+    """
+    if session_module.TOR_SOCKS_PORT or TorProcess.binary() is None:
+        return None
+    tor = TorProcess()
+    print("Connecting to the Tor network (the first time can take a minute) ...")
+    try:
+        tor.start()
+    except RuntimeError as error:
+        print(f"\nCould not start tor: {error}\n"
+              f"Trying a tor that is already running instead.\n")
+        return None
+    session_module.TOR_SOCKS_PORT = tor.socks_port
+    return tor
 
 
 def main() -> None:
     args = _parse_args()
+    if args.serve:
+        _serve(args.serve)
+        return
+
     _require(CLIENT_DEPENDENCIES, "client dependencies")
 
     import client_cli
     import screens
+    import session as session_module
     import storage
 
     storage.ensure_dirs()
@@ -511,16 +636,14 @@ def main() -> None:
         )
 
     prefs = storage.load_launcher_prefs()
-    choice = screens.start_screen(
-        default=screens.HOST if prefs.get("hosted") else screens.JOIN
-    )
+    choice = screens.start_screen(default=_start_screen_default(screens, prefs, args))
     if choice is None:
         return
 
     relay = None
-    onion = None
+    tor = None
     try:
-        if choice == screens.HOST:
+        if choice in (screens.HOST, screens.HOST_TOR):
             relay = LocalRelay(_relay_token())
             print("Starting the relay ...")
             try:
@@ -528,39 +651,59 @@ def main() -> None:
             except RuntimeError as error:
                 sys.exit(str(error))
 
-            if args.tor:
-                # Publishing reaches the whole Tor network, so it is opt-in
-                # rather than something hosting does on your behalf.
-                print("Publishing the onion service (this takes a minute) ...")
-                onion = TorHiddenService(relay.relay_port)
+            if choice == screens.HOST_TOR:
+                # Publishing reaches the whole Tor network, so it is a
+                # separate choice rather than something hosting does on your
+                # behalf.
+                print("Publishing the room on Tor (this takes a minute) ...")
+                tor = TorProcess(publish_port=relay.relay_port)
                 try:
-                    onion.start()
+                    tor.start()
                 except RuntimeError as error:
-                    onion = None
+                    tor = None
                     print(f"\nCould not publish over Tor: {error}\n"
                           f"Carrying on with the local room only.\n")
 
             if screens.host_ready_screen(
                     relay.addresses(),
-                    onion=onion.hostname if onion else None) is None:
+                    onion=tor.hostname if tor else None) is None:
                 return
             relay_default = f"127.0.0.1:{relay.relay_port}"
         else:
             relay_default = prefs.get("relay") or f"127.0.0.1:{PREFERRED_RELAY_PORT}"
 
-        details = _sign_in(screens, storage, client_cli, relay_default,
-                           hosting=choice == screens.HOST)
+        details = _sign_in(screens, storage, client_cli, relay_default, choice)
         if details is None:
             return
 
+        if details["use_tor"] and tor is None:
+            tor = _tor_for_joining(session_module)
+
         client_cli.run_session(details)
     finally:
-        if onion is not None:
-            print("Stopping the onion service ...")
-            onion.stop()
+        if tor is not None:
+            print("Stopping tor ...")
+            tor.stop()
         if relay is not None:
             print("Stopping the relay ...")
             relay.stop()
+
+
+def _hold_window(message) -> None:
+    """
+    Keep an error on screen in a packaged build.
+
+    Double-clicking opens a console that closes the moment we exit -- on
+    Windows always, elsewhere depending on the terminal -- taking the reason
+    with it. Spectre.command does the same for the script.
+    """
+    if message:
+        print(message if isinstance(message, str) else f"Exited with status {message}.",
+              file=sys.stderr)
+    try:
+        input("\nPress Enter to close this window.")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 if __name__ == "__main__":
@@ -568,3 +711,15 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print()
+    except SystemExit as exit_:
+        if FROZEN and exit_.code not in (None, 0) and "--serve" not in sys.argv:
+            _hold_window(exit_.code)
+            sys.exit(1)
+        raise
+    except Exception:
+        if not FROZEN or "--serve" in sys.argv:
+            raise
+        import traceback
+        traceback.print_exc()
+        _hold_window(None)
+        sys.exit(1)

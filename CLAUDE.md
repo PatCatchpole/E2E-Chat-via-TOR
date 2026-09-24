@@ -155,7 +155,9 @@ Each of these was a live vulnerability; each has a test that fails if it returns
   all five branches with `git filter-repo` and force-pushed, so no commit
   contains them now. They remain fetchable by old SHA through GitHub's fork
   network (README §10.2) and are permanently burned — never reuse them.
-- Work lives on `harden-protocol`; `main` is the old, vulnerable code.
+- `main` and `harden-protocol` are the same since v1.0.3 (fast-forwarded). The
+  old, vulnerable code survives only in history and the stale branches
+  (`back-end-tor`, `frontend`, `tor-test`).
 - Plain `mvn test` fails on `SpectreChatApplicationTests.contextLoads`: it is a
   `@SpringBootTest` and needs `SPECTRE_DB_PASSWORD` and a live Postgres. That
   is pre-existing, not a regression — scope to `-Dtest=MessageWireFormatTest`

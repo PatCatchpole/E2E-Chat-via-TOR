@@ -597,9 +597,6 @@ packet queue grew without bound; sign-in had no rate limiting at all.
    Every stored password hash predating the auth rewrite is also void; drop the
    users table and have people register again.
 
-3. **This work lives on `harden-protocol`, not `main`.** A fresh clone gets the
-   old, broken code. Merge it when you are satisfied with it.
-
 ### Possible next steps
 
 - **Sender keys.** Each member distributes one symmetric chain key over the

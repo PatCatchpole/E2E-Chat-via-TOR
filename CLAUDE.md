@@ -13,7 +13,7 @@ This file covers what the README does not: how to work in the repo.
 source .venv/bin/activate                  # Python 3.9 venv already present
 python spectre.py                          # the launcher: desktop window, starts everything
 python spectre.py --terminal               # same flow in the full-screen terminal UI
-python -m pytest tests/ -q                 # 129 tests, ~3s, all passing
+python -m pytest tests/ -q                 # 132 tests, ~3s, all passing
 cd back-end/spectre-chat && mvn -B compile # Java 25 + Maven are installed and it builds
 cd back-end/spectre-chat && mvn -B test -Dtest=MessageWireFormatTest   # pins the stored-message format
 python packaging/build.py                  # one-file dist/Spectre with tor inside (pyinstaller is in the venv)

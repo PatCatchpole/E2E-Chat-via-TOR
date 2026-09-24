@@ -172,3 +172,24 @@ def test_room_names_must_be_one_short_line():
     assert b.enter("")["ok"] is False
     assert b.enter("a\nb")["ok"] is False
     assert b.enter("x" * (desktop.ROOM_MAX + 1))["ok"] is False
+
+
+def test_a_failed_tor_is_reported_not_only_the_fallback(monkeypatch):
+    # The first Windows run showed only "Tried 127.0.0.1:9050, 9150": the
+    # fallback's error. Why Spectre's own tor did not start was thrown away.
+    reason = "Could not start tor: tor exited.\n  Log: tor.log"
+    b = desktop.Bridge(desktop.Launcher(host=None, client_tor=lambda: reason, prefs={}))
+    b._mode, b._user, b._password, b._relay_url = "join", "alice", "pw", "http://" + ONION
+
+    def unreachable(self):
+        raise desktop.SessionError("could not reach the relay through Tor.")
+
+    monkeypatch.setattr(desktop.SpectreSession, "connect", unreachable)
+    pushed = []
+    monkeypatch.setattr(b, "_push", lambda kind, payload: pushed.append((kind, payload)))
+    b._enter("spectre")
+
+    kind, payload = pushed[-1]
+    assert kind == "enter_failed"
+    assert payload["text"].startswith(reason)
+    assert "could not reach the relay" in payload["text"]

@@ -98,7 +98,8 @@ class Launcher:
 
     `host(progress)` starts the relay and publishes it, calling
     `progress(step, **info)` as it goes, and returns our own relay URL.
-    `client_tor()` starts a tor for joining and returns its SOCKS port, or None.
+    `client_tor()` starts a tor for joining. It returns None, or why that tor
+    did not start -- the session then falls back to one already running.
     """
 
     def __init__(self, host, client_tor, prefs):
@@ -253,10 +254,11 @@ class Bridge:
 
     def _enter(self, room: str) -> None:
         use_tor = self._mode == "join"
+        tor_failure = None
         try:
             if use_tor:
                 self._push("status", {"text": "Connecting to the Tor network. The first time can take a minute."})
-                self._launcher.client_tor()
+                tor_failure = self._launcher.client_tor()
             session = SpectreSession(
                 url=self._relay_url, room=room, user=self._user,
                 password=self._password, use_tor=use_tor, on_event=self._on_event,
@@ -268,7 +270,10 @@ class Bridge:
         except SessionError as e:
             with self._lock:
                 self._entering = False
-            self._push("enter_failed", {"text": str(e), "back": "signin"})
+            text = str(e)
+            if tor_failure:
+                text = f"{tor_failure}\n\nThe fallback failed too: {text}"
+            self._push("enter_failed", {"text": text, "back": "signin"})
             return
         except Exception as e:
             with self._lock:

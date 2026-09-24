@@ -372,13 +372,13 @@ class TorProcess:
                 return path
         return None
 
-    @staticmethod
-    def _path(path: Path) -> str:
-        # Quoted so a home directory with a space in it survives, and with
-        # forward slashes because a quoted torrc value treats backslashes as
-        # escapes -- which every Windows path is full of. Tor on Windows
-        # accepts forward slashes.
-        return '"' + path.as_posix() + '"'
+    # Every path tor is given is relative to self.root, which is its working
+    # directory. Tor on Windows reads torrc and its arguments in the ANSI code
+    # page, not UTF-8, so an absolute path through a home directory such as
+    # C:\Users\B2B Soluções came out as "Solu√ß√µes" and tor could not create
+    # its DataDirectory (v1.0.2, the first real Windows run). A relative path
+    # never contains the user's name. It also sidesteps the quoting that a
+    # space in the home directory and Windows backslashes used to need.
 
     def start(self, on_bootstrapped=None) -> None:
         """
@@ -404,7 +404,7 @@ class TorProcess:
         lines = [
             "# Written by spectre.py. Self-contained: no system tor config.",
             f"SocksPort {self.socks_port}",
-            f"DataDirectory {self._path(self.root / 'data')}",
+            "DataDirectory data",
             # To stdout, which is redirected to tor.log below. A `Log ... file`
             # line cannot take a quoted path, so it would break on a space.
             "Log notice stdout",
@@ -417,7 +417,7 @@ class TorProcess:
         ]
         if self.publish_port:
             lines += [
-                f"HiddenServiceDir {self._path(self.service_dir)}",
+                f"HiddenServiceDir {self.service_dir.name}",
                 f"HiddenServicePort 80 127.0.0.1:{self.publish_port}",
             ]
         torrc = self.root / "torrc"
@@ -434,7 +434,7 @@ class TorProcess:
                              os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         self.handle = os.fdopen(descriptor, "w", encoding="utf-8")
         self.process = subprocess.Popen(
-            [binary, "-f", str(torrc)],
+            [binary, "-f", torrc.name],
             cwd=str(self.root), env=environment,
             stdout=self.handle, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -719,9 +719,20 @@ def _run_desktop(storage, session_module) -> None:
         return relay.local_url
 
     def client_tor():
-        tor = _tor_for_joining(session_module, say=lambda _text: None)
+        # The terminal prints why our tor failed before falling back; the
+        # window has nowhere to print it, so it is handed back instead. Without
+        # this the only error shown was the fallback's 9050/9150 message,
+        # which says nothing about the tor that actually failed.
+        failure = []
+
+        def say(text):
+            if text.lstrip().startswith("Could not start tor"):
+                failure.append(text.strip())
+
+        tor = _tor_for_joining(session_module, say=say)
         if tor is not None:
             children["client_tor"] = tor
+        return failure[0] if failure else None
 
     try:
         desktop.run(desktop.Launcher(host, client_tor, storage.load_launcher_prefs()))

@@ -375,8 +375,9 @@ class TorProcess:
     # Every path tor is given is relative to self.root, which is its working
     # directory. Tor on Windows reads torrc and its arguments in the ANSI code
     # page, not UTF-8, so an absolute path through a home directory such as
-    # C:\Users\B2B Soluções came out as "Solu√ß√µes" and tor could not create
-    # its DataDirectory (v1.0.2, the first real Windows run). A relative path
+    # C:\Users\João Gonçalves came out with its accented letters garbled and
+    # tor could not create its DataDirectory (v1.0.2, the first real Windows
+    # run, under an account name with accents in it). A relative path
     # never contains the user's name. It also sidesteps the quoting that a
     # space in the home directory and Windows backslashes used to need.
 

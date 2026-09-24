@@ -2,8 +2,9 @@
 The torrc and command line the launcher gives tor.
 
 Tor on Windows reads both in the ANSI code page rather than UTF-8. The first
-real Windows run (v1.0.2) was under C:\\Users\\B2B Soluções: the absolute
-DataDirectory in torrc arrived as "Solu√ß√µes", tor could not create it, and
+real Windows run (v1.0.2) was under an account name with accents in it: the
+absolute DataDirectory in torrc arrived with those letters garbled, tor could
+not create it, and
 joining failed with an error about ports 9050/9150 instead. Nothing tor is
 given may carry the home directory's name.
 """
@@ -22,7 +23,7 @@ import spectre  # noqa: E402
 
 @pytest.mark.parametrize("publish_port", [None, 5999])
 def test_tor_is_given_no_path_through_the_home_directory(tmp_path, monkeypatch, publish_port):
-    home = tmp_path / "B2B Soluções"
+    home = tmp_path / "João Gonçalves"
     home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(spectre.TorProcess, "binary", staticmethod(lambda: "tor"))
